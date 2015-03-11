@@ -1,0 +1,8 @@
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind1.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind2.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind3.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind4.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind5.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind6.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind7.bam
+/home/ke/Desktop/SeqCap/denovoTargetCapture/associated_files/ANGSD/alignment/ind8.bam

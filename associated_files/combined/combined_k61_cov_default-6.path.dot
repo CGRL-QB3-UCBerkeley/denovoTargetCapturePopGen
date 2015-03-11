@@ -1,0 +1,4 @@
+digraph adj {
+graph [k=61]
+edge [d=-60]
+}

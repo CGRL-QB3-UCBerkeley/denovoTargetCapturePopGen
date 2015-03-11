@@ -1,0 +1,4 @@
+library        P7       P5
+CGRL_index1	1
+CGRL_index15	15
+CGRL_index40	40

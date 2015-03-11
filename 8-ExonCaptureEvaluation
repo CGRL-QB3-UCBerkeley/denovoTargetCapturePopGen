@@ -1,0 +1,665 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Getopt::Std;
+use Getopt::Long;
+use File::Basename;
+use List::Util qw[min max];
+use List::Util qw(sum);
+use File::Temp;
+
+#Ke - kebi@berkeley.edu
+
+&main;
+exit;
+
+
+sub main {
+  &usage if (@ARGV<1);
+  my $command = shift(@ARGV);
+  my %p = (MakeBed=>\&MakeBed, Evaluation=>\&Evaluation);
+  die("Unknown command \"$command\"\n") if (!defined($p{$command}));
+  &{$p{$command}};
+}
+
+sub usage {
+  die(qq/
+Usage: ExonCaptureTools.pl <command> [<arguments>]\n
+Command: 
+
+
+MakeBed: Make a bed file for extracting regions of interest
+
+Evaluation: Calculate sensitivity and specificity
+
+\n/);
+}
+
+sub MakeBed {
+  die(qq/
+Usage  ExonCaptureTools.pl MakeBed [options]
+
+Options: 
+
+-b  FILE   a bed file that contain regions with probes tiled 
+-r  INT    offset bp you would like to add onto the coordinate [500]   
+
+\n/) if (!@ARGV);
+  
+  my %opts = (b=>undef, r=>500);
+  getopts('b:r:', \%opts);
+  
+  my $bed = $opts{b} ||  die ("\nError! You must provide a bed file!\n\n");
+  my $offset = $opts{r};
+  
+  open (BED, "<", $bed) || die "Not able to open the file: $bed \n";
+  my @Bed;
+  my $count =0;
+  while (<BED>) {
+    chomp (my @name = split /\s+/, $_);
+    #add bed to matrix
+    
+      $Bed[$count] -> [0] = $name[0]; #contig name
+      $Bed[$count] -> [1] = $name[1]; #start coordinate
+      $Bed[$count] -> [2] = $name[2]; #end coordinate
+      $count++;
+    
+  }
+  close BED;
+  
+  @Bed = sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] || $a->[2] <=> $b->[2]} @Bed; 
+
+  
+  my ($tmp_offset, $tmp);
+
+  #create temp files to save space!  
+  $tmp_offset = File::Temp->new(SUFFIX=>'.offset');
+  $tmp = File::Temp->new(SUFFIX=>'.original');
+
+  foreach (@Bed) {
+    print $tmp @{$_}[0], "\t", @{$_}[1], "\t", @{$_}[2], "\n";   
+    if (@{$_}[1] >= $offset) {
+      print $tmp_offset @{$_}[0], "\t", @{$_}[1]-$offset, "\t", @{$_}[2]+$offset, "\n";
+    }
+    else {
+      print $tmp_offset @{$_}[0], "\t", 0, "\t",  @{$_}[2]+$offset, "\n";
+    }
+  }
+  
+  seek $tmp, 0, 0; #rewind $region list to beginning for main loop
+  seek $tmp_offset, 0, 0;
+  
+  my $out1 = $bed . "_offset_final";
+  mining ($tmp_offset, $out1);
+  my $out2 = $bed . "_final";
+  mining ($tmp, $out2);
+  unlink ($tmp_offset, $tmp);
+  
+  sub mining {
+    my ($file, $out) = @_;
+    open (IN, "<", $file);
+    open (OUT, ">", $out);
+    
+    chomp (my $first = <IN>);
+    my @d = split /\s+/, $first;
+    
+    my $gene = $d[0];
+    my $start = $d[1];
+    my $end = $d[2];
+    
+    while (<IN>) { ##do not forget to process the end of file!!
+      
+      chomp (my @line = split /\s+/, $_);
+      if ($line[0] eq $gene) {
+	
+	if (!eof){ ## if not the end of the file
+	  
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    $start = $line[1];
+	    $end = $line[2];
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	 	  
+	  }
+	  if ($line[1] < $start) {
+	    $start = $line[1];
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	  
+	  }
+	}
+	
+	else { #end of the file; need to print both lines. Same as below
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $start, "\t", $line[2], "\n";	      
+	    } 
+	    else {
+	      print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    }
+	  }
+	  if ($line[1] < $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	    }
+	    else {
+	      print OUT $gene, "\t", $line[1], "\t", $end, "\n";
+	    } 
+	  }
+	}	
+      }
+      
+      
+      if ($line[0] ne $gene) {
+	if (!eof) {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";	
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2];   
+	}
+	else {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2]; 
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	}
+      }
+    }
+    close IN;
+    close OUT;
+  } 
+}
+
+
+
+
+
+sub Evaluation {
+  die(qq/
+Usage  ExonCaptureTools.pl Evaluation [options]
+
+Dependencies: SAMTools, BEDtools
+
+Options: 
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+-genome       FILE    Reference genome; Required 
+ 
+-cleanDir     DIR     Path to a folder with all cleaned reads (XXX_1_final.txt, 
+                      XXX_2_final.txt, XXX_u_final.txt); Required
+
+-rawDir       DIR     Path to a folder with all raw reads (XXX_R1.fq, XXX_R2.fq); Required
+
+-bamDir       DIR     Path to a folder with all sorted bam files (XXX_sorted.bam); Required
+
+-InstrID      CHR     Instrument ID (i.e. HS, MS or HWI); Required
+
+-resDir       DIR     Path to the results directory; Required
+
+-readLen      INT     Read length [100]
+
+-bedFile      FILE    A bed file that contain regions that probes are tiled
+                      make sure to run ExonCaptureTools.pl MakeBed
+                      skip this option if no bed file (e.g. genome data) 
+
+-window       INT     Size in bp, calculate coverage over windows (e.g 1000)  
+                      you can skip this option if not interested
+                      it takes quite a while to run
+                    
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~                       
+
+
+\n/) if (!@ARGV);
+  
+  my ($genome, $cleanDir, $rawDir,$bamDir, $resDir, $InstrID, $bedFile,$window) = (undef, undef, undef, undef, undef, undef,undef,undef);
+  my %opts = (readLen => [100]);
+  GetOptions('genome=s@{1,1}' => \$genome,'cleanDir=s@{1,1}' => \$cleanDir,'rawDir=s@{1,1}' => \$rawDir, 'bamDir=s@{1,1}' => \$bamDir, 'bedFile=s@{1,1}' => \$bedFile, 'resDir=s@{1,1}' => \$resDir,'InstrID=s@{1,1}' => \$InstrID,'readLen=s@{1,1}' => \$opts{readLen},  'window=s@{1,1}' => \$window);
+
+  my $len;
+  if (@{$genome}[0]){
+    my $file = @{$genome}[0];
+    open (IN, "<", $file);    
+    while (<IN>) {
+      chomp (my $line = $_);
+      if ($line !~ m /^>/) {
+	$line =~ s/N//g;
+	$len += length ($line);
+      }
+    }
+    print "The total number of unmaksed bases in this reference genome is ", $len, ".\n";
+  }
+  my $InID = @{$InstrID}[0];
+  my $readl = @{$opts{readLen}}[0];
+  
+  
+  my $rawD;
+  if (@{$rawDir}[0]){
+    if (@{$rawDir}[0] =~ m/\/$/ ){
+      $rawD = @{$rawDir}[0]; 
+    }
+    else {
+      $rawD = @{$rawDir}[0] . "/";
+    }
+  }
+  
+  my $cleanD;
+  if (@{$cleanDir}[0]){
+    if (@{$cleanDir}[0] =~ m/\/$/ ){
+      $cleanD = @{$cleanDir}[0]; 
+    }
+    else {
+      $cleanD = @{$cleanDir}[0] . "/";
+    }
+  }
+  
+  my $bamD;
+  if (@{$bamDir}[0]) {
+    if (@{$bamDir}[0] =~ m/\/$/ ){
+      $bamD = @{$bamDir}[0]; 
+    }
+    else {
+      $bamD = @{$bamDir}[0] . "/";
+    }
+  }
+  
+  my $resD;
+  if (@{$resDir}[0] =~ m/\/$/ ){
+    $resD = @{$resDir}[0]; 
+    }
+  else {
+    $resD = @{$resDir}[0] . "/";
+  }
+  
+  my $out = $resD . "data_metrics.txt";
+  open (OUT, ">", $out);
+  print OUT "Library", "\t", "rawData(Mb)", "\t", "cleanedData(Mb)", "\t", "DataMapped(Mb)", "\t","Specificity(%)", "\t", "Sensitivity(%)", "\t", "AvgCoverage(X)",  "\t","CoverageVar",  "\t",  "AvgCoverageStd", "\t", "Sites2X(%)","\t", "Sites5X(%)","\t", "Sites10X(%)","\t", "Sites20X(%)", " \n";
+  my @bam = <$bamD*sorted.bam>;
+  my @raw = <$rawD*_R1.fq>;
+  my @clean = <$cleanD*_1_final.txt>;
+
+  my $mas1;
+  $mas1 = data (\@raw, \@clean,  $readl, $InID);
+
+  my $mas2;
+  my $mas3;
+  my $mas4;
+  
+  if (@{$bedFile}[0]) {
+    $mas2 = sensitivity (\@bam, @{$bedFile}[0],$len);
+    $mas3 = specificity (\@bam, @{$bedFile}[0]);
+    open (IN, "<", @{$bedFile}[0]);
+    my $totalSite;
+    while (<IN>) {
+      chomp (my @line = split /\s+/, $_);
+      if ($line[2] && $line[1]) {
+	$totalSite += $line[2] - $line[1];
+      }
+    }
+      #print "The total number of targeted bp is ", $totalSite , ".\n";
+  }
+  
+  if (!@{$bedFile}[0]) {
+    $mas2 = sensitivity (\@bam, 1,$len);  
+    $mas3 = specificity (\@bam, 1);
+  }
+  
+  my %mas1 = %{$mas1};
+  my %mas2 = %{$mas2};
+  my %mas3 = %{$mas3};
+  
+  foreach my $id (sort {$a cmp $b} keys %mas1) {
+    print OUT $id, "\t", $mas1{$id}{'raw'}, "\t", $mas1{$id}{'clean'},"\t", $mas3{$id}{'mapped'},"\t", sprintf("%.2f", $mas3{$id}{'mapped'}/$mas1{$id}{'clean'}*100), "\t", $mas2{$id}{'sen'}, "\t", $mas2{$id}{'cov'}, "\t", $mas2{$id}{'covvar'},"\t", $mas2{$id}{'std'}, "\t", $mas2{$id}{'2'}, "\t", $mas2{$id}{'5'},"\t", $mas2{$id}{'10'},"\t", $mas2{$id}{'20'},"\n";
+    
+  }
+  close OUT;
+ 
+  if (@{$window}[0]) {  
+    window (\@bam, $resD, @{$window}[0]);
+  }
+  
+  sub window {
+    my ($bam, $dir, $inc) = @_;
+    my @bam = @{$bam}; 
+    
+    foreach (@bam) {
+      my $file = $_;
+      my $lib = $1 if basename($file) =~ m /(\S+)_sorted.bam/;
+      
+      print "\nNow generating binned coverage datafile for ", $lib, "!\n";
+      
+      my $genomecov = $dir . $lib . "_" . "genomeCov.txt";
+      
+      system ("bedtools genomecov -ibam $file  -d -split > $genomecov");
+      
+      open (IN, "<", $genomecov);
+      chomp (my $first = <IN>);
+      my @d = split /\s+/, $first;
+      my $out = $dir. $lib .'_chromosome_' . $d[0]. '_' . $inc . 'bp_window' . '.txt';
+      open (OUT, ">", $out);
+      
+      my $id = $d[0];
+      my $count = $d[2];
+      my $add = 1;
+      my $bin = $inc;
+      
+      while (<IN>) {
+	chomp (my @line = split/\s+/, $_);
+	
+	if ($line[0] eq $id){
+	  if (!eof) {
+	    $count += $line[2];
+	    $add++;
+	    if ($add == $bin) {
+	      print OUT $line[0], "\t", $bin-$inc+1, "\t", $add, "\t",  $count/($add-$bin+$inc), "\n";
+	      $count = 0;
+	      $bin += $inc;
+	    }
+	    
+	  }
+	  else {
+	    $count += $line[2];
+	    $add++;
+	    print OUT $line[0], "\t", $bin-$inc+1, "\t", $add, "\t",  $count/($add-$bin+$inc), "\n";
+	    close OUT;
+	  }
+	}
+	
+	if ($line[0] ne $id){
+	  if (!eof) {
+	    if ($add > $bin-$inc) {
+	      print OUT $id, "\t", $bin-$inc+1, "\t", $add, "\t",  $count/($add-$bin+$inc), "\n";
+	    }
+	    close OUT;
+	    @d = @line;
+	    my $out = $dir. $lib .'_chromosome_' . $d[0]. '_' . $inc . 'bp_window' . '.txt';
+	    open (OUT, ">", $out);
+	    $count = $d[2];
+	    $add = 1; 
+	    $bin = $inc;
+	    $id = $d[0];
+	  }
+	  
+	  else {
+	    if ($add > $bin-$inc) {
+	      print OUT $id, "\t", $bin-$inc+1, "\t", $add, "\t",  $count/($add-$bin+$inc), "\n";
+	    }
+	    close OUT;
+	    @d = @line;
+	    my $out = $dir. $lib .'_chromosome_' . $d[0]. '_' . $inc . 'bp_window' . '.txt';
+	    open (OUT, ">", $out);
+	    $count = $d[2];
+	    $id = $d[0];
+	    print OUT $id, "\t", 1, "\t", 1, "\t",  $count, "\n";
+	    close OUT;
+	  }
+	  
+	}
+	
+      }
+    }
+  }
+  
+  sub specificity {
+    my ($bam, $bed) = @_;
+    my @bam = @{$bam}; 
+    my %master;
+    foreach (@bam) {
+      
+      my $file = $_;
+      my $id = $1 if basename($file) =~ m /(\S+)_sorted.bam/;
+      
+      print "\nNow calculating specificity for ", $id, "!\n";
+      
+      if ($bed =~ m /\b1\b/) { 
+	my @call = `samtools view $file`;
+	my $data;
+	foreach (@call) {
+	  my @line = split /\s+/, $_;
+	  my $d = $line[5];
+	  next if $line[5] =~ /\*/;
+	  my @a = ($d =~ m/(\d+)M/g);
+	  my $sum = sum(@a);
+	  $data += $sum;
+	}
+	my $final = sprintf("%.2f", $data/1000000);
+	$master{$id}{'mapped'} = $final;   
+      }
+      else {
+	my @call = `samtools view -L $bed $file`;
+	my $data;
+	foreach (@call) {
+	  my @line = split /\s+/, $_;
+	  my $d = $line[5];
+	  next if $line[5] =~ /\*/;
+	  my @a = ($d =~ m/(\d+)M/g);
+	  my $sum = sum(@a);
+	  $data += $sum;
+	}
+	my $final = sprintf("%.2f", $data/1000000);
+	$master{$id}{'mapped'} = $final;   	
+      }
+    }
+    return (\%master);
+  }
+  
+  sub sensitivity {
+    my ($bam, $bed, $len) = @_;
+    my %master;
+    
+    my @all = @{$bam};
+    foreach (@all) {
+      my $sites = 0;
+      my $cov = 0;
+      my $expxsqr = 0;
+      my $file = $_;
+      my $one = 0;
+      my $five = 0;
+      my $ten = 0;
+      my $twenty = 0;
+      
+      my $lib = $1 if basename($file) =~ m/(\S+)_sorted.bam/;
+      print "\nNow calculating sensitivity and coverage for ", $lib, "!\n";
+      if ($bed =~ m /\b1\b/) {      
+	my @call = `samtools depth -q 0 $file`;
+	foreach (@call) {
+	  $sites++;
+	  chomp (my @line = split /\s+/, $_);
+	  if ($line[2] >= 2 && $line[2] < 5 ) {
+	    $one++;	  
+	  }
+	  if ($line[2] >= 5 && $line[2] < 10 ) {
+	    $one++;$five++;	  
+	  }
+	  if ($line[2] >= 10 && $line[2] < 20 ) {
+	    $one++;$five++;$ten++;	  
+	  }
+	  if ($line[2] >= 20 ) {
+	    $one++;$five++;$ten++;$twenty++;	  
+	  }
+	  $cov += $line[2];
+	  $expxsqr = $expxsqr + ($line[2] ** 2);
+	}
+	my $result =  sprintf("%.2f",$sites/$len*100);
+	my $final_coverage = sprintf("%.2f", $cov/$len);
+	my $final1 =  sprintf("%.2f",$one/$len*100);
+	my $final5 =  sprintf("%.2f",$five/$len*100);
+	my $final10 =  sprintf("%.2f",$ten/$len*100);
+	my $final20 =  sprintf("%.2f",$twenty/$len*100);   
+	my $varq = ($expxsqr - (($cov ** 2) / $sites)) / ($sites - 1); 
+	my $std = sqrt ($varq);
+	$master{$lib}{'sen'} = $result; 
+	$master{$lib}{'cov'} = $final_coverage;	
+	$master{$lib}{'covvar'} =  sprintf("%.2f",$varq);
+	$master{$lib}{'std'} =  sprintf("%.2f",$std);
+	$master{$lib}{'2'} =  sprintf("%.2f",$final1);
+	$master{$lib}{'5'} =  sprintf("%.2f",$final5);
+	$master{$lib}{'10'} =  sprintf("%.2f",$final10);
+	$master{$lib}{'20'} =  sprintf("%.2f",$final20);
+      } ###if ($bed =~ m /\b1\b/) { 
+
+      else {
+	my @call = `samtools depth  -b $bed -q 0 $file`;
+        foreach (@call) {
+	  $sites++;
+	  chomp (my @line = split /\s+/, $_);
+	  if ($line[2] >= 2 && $line[2] < 5 ) {
+	    $one++;	  
+	  }
+	  if ($line[2] >= 5 && $line[2] < 10 ) {
+	    $one++;$five++;	  
+	  }
+	  if ($line[2] >= 10 && $line[2] < 20 ) {
+	    $one++;$five++;$ten++;	  
+	  }
+	  if ($line[2] >= 20 ) {
+	    $one++;$five++;$ten++;$twenty++;	  
+	  }
+	  $cov += $line[2];
+	  $expxsqr = $expxsqr + ($line[2] ** 2);
+	}
+	my $totalS;
+	open (IN, "<", $bed);
+	while (<IN>) {
+	  chomp (my @line = split /\s+/, $_);	  
+	    $totalS += $line[2] - $line[1];
+	}
+	close IN;
+	my $result =  sprintf("%.2f",$sites/$totalS*100);
+	my $final_coverage = sprintf("%.2f",$cov/$totalS);
+	my $final1 =  sprintf("%.2f",$one/$totalS*100);
+	my $final5 =  sprintf("%.2f",$five/$totalS*100);
+	my $final10 =  sprintf("%.2f",$ten/$totalS*100);
+	my $final20 =  sprintf("%.2f",$twenty/$totalS*100);   
+	my $varq = ($expxsqr - (($cov ** 2) / $totalS)) / ($totalS - 1); 
+	my $std = sqrt ($varq);
+	$master{$lib}{'sen'} = $result; 
+	$master{$lib}{'cov'} = $final_coverage;
+	$master{$lib}{'covvar'} =  sprintf("%.2f",$varq);
+	$master{$lib}{'std'} =  sprintf("%.2f",$std);
+	$master{$lib}{'2'} =  sprintf("%.2f",$final1);
+	$master{$lib}{'5'} =  sprintf("%.2f",$final5);
+	$master{$lib}{'10'} =  sprintf("%.2f",$final10);
+	$master{$lib}{'20'} =  sprintf("%.2f",$final20);	
+      } ##else
+
+    
+} ##foreach (@call)
+    return (\%master);
+  }
+
+
+  sub data {
+    my ($raw, $clean, $length,$InID)= @_;    
+    my @raw = @{$raw};
+    my @clean = @{$clean};
+    my %master;   
+    foreach (@raw) {
+      my $lib = $1 if basename($_) =~ m/(\S+)_R1.fq/;
+      print "\nNow calculating the size of raw data for ", $lib, "!\n";
+      
+      open (IN, "<", $_);
+      my $count=0;
+      while (<IN>) {
+	chomp (my $line = $_);
+	if ($line =~ m /^\@$InID/) {
+	  $count++;
+	}
+      }
+      close IN;
+      my $result = sprintf("%.2f",2*$count*$length/1000000);
+      $master{$lib}{'raw'} = $result; 
+    }
+    
+    foreach my $file1 (@clean) {
+      my $file2 = $file1;
+      $file2 =~ s/_1_final/_2_final/;
+      my $fileu = $file1;
+      $fileu =~ s/_1_final/_u_final/;
+      my $lib = $1 if basename($file1) =~ m/(\S+)_1_final.txt/i;   
+       print "\nNow calculating the size of cleaned data for ", $lib, "!\n";
+      my $total_length = tot_length($file1,$InID) + tot_length($file2,$InID) + tot_length($fileu,$InID); 
+      my $result = sprintf("%.2f",$total_length/1000000);
+      $master{$lib}{'clean'} = $result; 
+      
+    }
+    sub tot_length {
+      my ($file,$InID) = @_;
+      open (IN, "<", $file);
+      my $totlength = 0;
+      while (<IN>) {
+	chomp(my $line = $_);
+	if ($line =~ m/^\@$InID/) {
+	  chomp(my $seq = <IN>);
+	  chomp(my $qualID = <IN>);
+	  chomp(my $qual = <IN>);
+	  $totlength += length($seq);
+	}
+      }
+      close IN;
+      return ($totlength);
+    }
+    
+  return (\%master);
+  
+    
+  }
+  
+  
+  
+  
+}
+  
+  
+  
+  
+
+
+
+
+  
+  
+
+
+
+
+
+
+  
+
+ 
+
+
+
+
+  
+
+
+  
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

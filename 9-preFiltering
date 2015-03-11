@@ -1,0 +1,405 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+use Getopt::Std;
+use File::Basename;
+use Tie::Array::Packed;
+
+&main;
+exit;
+
+sub main {
+  &usage if (@ARGV<1);
+  my $command = shift(@ARGV);
+  my %fun = (summary=>\&summary, percentile=>\&percentile, bed=>\&bed);
+  die("Unknown command \"$command\"\n") if (!defined($fun{$command}));
+  &{$fun{$command}};
+}
+
+sub usage {
+  die(qq/
+Usage:  preFiltering <command> [<arguments>]\n
+Command: 
+
+percentile: calculate percentiles for site and contigs
+
+bed: extract targeted regions from assemblied contigs
+
+
+\n/);
+}
+
+
+sub percentile {
+  die(qq/
+
+9-preFiltering percentile [options] 
+
+options:
+
+-b    FILE    A merged, sorted bam file             
+-o    CHAR    Result prefix
+-B    FILE    A bed file. if no bed file 
+              then do not use -B
+-m    INT     Minimal percentile threthrold 
+              to keep a contig [1]            
+-n    INT     Maximal percentile threthrold 
+              to keep a contig [99] 
+-s    INT     S standard deviations of the mean 
+              to keep a contig [3]
+ 
+\n\n/) unless (@ARGV);
+  
+  #modified based on codes written by choroba
+  #very smart way for calculating percentiles
+  
+  my %opts = (b=>undef,o=>undef, m=>5, n=>95, s=>3,B=>undef);
+  getopts('b:o:m:n:s:B:', \%opts);
+  
+  my $min = $opts{m};
+  my $max = $opts{n}; 
+  my $s = $opts{s};
+  my $file = 'depth';
+  my $bam = $opts{b};
+  my $per_gene_depth = $opts{o} . "_gene_depth.txt";
+  my $gene_depth_percentile = $opts{o} . "_gene_depth_percentile.txt";
+  my $site_depth_percentile = $opts{o} . "_site_depth_percentile.txt";
+  my $gene_outside_percentile = $opts{o} . "_gene_outside_percentile.txt";
+  my $gene_outside_sd = $opts{o} . "_gene_outside_sd_filter.txt";
+  my $site_depth = $opts{o} . "_site_depth.txt";
+
+
+  
+  if ($opts{B}) {
+  system ("samtools depth -b $opts{B} $bam > $file");
+  }
+  unless ($opts{B}) {
+   system ("samtools depth  $bam > $file");
+  }
+
+  tie my @site, 'Tie::Array::Packed::Number';
+  tie my @gene, 'Tie::Array::Packed::Number';
+
+
+  my $stotalq = 0;
+  my $scount = 0;
+  my $sexpxsqr = 0;
+  
+  open (IN, "<", $file);
+  open (S, ">", $site_depth);
+  
+  my %gene;
+  while (<IN>) {
+    chomp (my @l =split /\s+/, $_);
+    $gene{$l[0]}{'dep'} += $l[2];
+    print S $l[2], "\n";
+    $gene{$l[0]}{'count'} ++;
+    push @site, $l[2]; 
+    $stotalq = $stotalq + $l[2];
+    $sexpxsqr = $sexpxsqr + ($l[2] ** 2);
+    $scount++;
+  }
+  close IN;
+  close S;
+  unlink ($file);
+  my $sexpq = $stotalq/$scount; 
+  my $svarq = ($sexpxsqr - (($stotalq ** 2) / $scount)) / ($scount - 1); 
+  my $sstd = sqrt ($svarq);
+
+     
+  my $totalq = 0;
+  my $count = 0;
+  my $expxsqr = 0;
+  
+  open (OUT1, ">", $per_gene_depth);
+  
+  foreach my $g (sort { $a cmp $b} keys %gene) {
+    print OUT1 $g, "\t",  $gene{$g}{'dep'}/$gene{$g}{'count'},"\n";
+    $totalq = $totalq + $gene{$g}{'dep'}/$gene{$g}{'count'};
+    $expxsqr = $expxsqr + (($gene{$g}{'dep'}/$gene{$g}{'count'}) ** 2);
+    $count++;
+    push @gene, $gene{$g}{'dep'}/$gene{$g}{'count'} ;
+  }
+  close OUT1;
+  
+  my $expq = $totalq/$count; 
+  my $varq = ($expxsqr - (($totalq ** 2) / $count)) / ($count - 1); 
+  my $std = sqrt ($varq);
+  
+  my $high;
+  my $low;
+  
+  open (OUT2, ">", $gene_depth_percentile);
+  tied(@gene)->sort;
+  print OUT2 "gene depth mean: ", sprintf("%.2f", $expq), "\n";
+  print OUT2 "gene depth standard deviation: ", sprintf("%.2f", $std), "\n";
+  print "gene depth mean: ", sprintf("%.2f", $expq), "\n";
+  print "gene depth standard deviation: ", sprintf("%.2f", $std), "\n";
+  
+  print OUT2 "gene percentile:", "\n";
+  print "gene percentile:", "\n";	
+  foreach my $id (1,2.5, 5,10,20,30,40,50,60,70,80,90,95,97.5, 99) {
+    
+    print OUT2 $id . " precent percentile: ",  sprintf("%.2f", $gene[$#gene*$id/100]), "\n";
+   $low = sprintf("%.2f", $gene[$#gene*$id/100]) if $id == $min; 
+   $high = sprintf("%.2f", $gene[$#gene*$id/100]) if $id == $max; 
+  
+    print $id . " precent percentile: ",  sprintf("%.2f", $gene[$#gene*$id/100]), "\n";
+    
+  }
+  close OUT2;
+  print "~~~~~~~~~~~~~~~~~~~", "\n";
+  open (OUT3, ">", $site_depth_percentile);
+  
+  print OUT3 "site depth mean: ", sprintf("%.2f", $sexpq), "\n";
+  print OUT3 "site depth standard deviation: ", sprintf("%.2f", $sstd), "\n";
+  print "site depth mean: ", sprintf("%.2f", $sexpq), "\n";
+  print "site depth standard deviation: ", sprintf("%.2f", $sstd), "\n";
+  
+  
+  print OUT3 "site_percentile:", "\n"; 
+  print "site_percentile:", "\n";
+  
+  
+  
+  tied(@site)->sort;
+  for (1,2.5, 5,10,20,30,40,50,60,70,80,90,95,97.5, 99) {
+    
+    print OUT3 $_ . " precent percentile: ",  sprintf("%.2f", $site[$#site*$_/100]), "\n";
+    print $_ . " precent percentile: ",  sprintf("%.2f", $site[$#site*$_/100]), "\n";
+   
+ 
+  }
+  close OUT3;
+  open (GENE, "<", $per_gene_depth);
+  open (OUT4, ">", $gene_outside_percentile);
+  open (OUT5, ">", $gene_outside_sd);
+
+
+  while (<GENE>) {
+  chomp (my @a = split /\s+/,$_);
+  print OUT4 $a[0], "\n" if ($a[1] < $low || $a[1] > $high);
+  print OUT5 $a[0], "\n" if ($a[1] < $expq -  $std * $s || $a[1] >  $expq + $std * $s);
+  }
+
+  close OUT4;
+  close OUT5;
+  close GENE;
+
+}
+
+
+
+sub bed {
+die (qq/
+
+Usage: 9-preFiltering bed <original_target> <in_target_assemblies>
+
+\n/) if !@ARGV;
+
+
+my $ori = $ARGV[0];
+my $ass = $ARGV[1];
+
+my $id;
+my %original;
+open (ORI, "<", $ori);
+while (<ORI>) {
+  chomp (my $line = $_);
+  if ($line =~ m /^>(\S+)/ ) {
+    #my @id = split /_/, $line;
+    #$id = 'Darco' . "_" . $id[3] . "_" . $id[4] . "_" . $id[5] if $id[3];
+    $id = $1;
+    #print $id, "\n";
+  }
+  else {
+    $original{$id} .= $line; 
+  }
+}
+close ORI;
+
+
+my $d;
+
+my $bed = 'final.bed';
+my $missed = 'missed.loci';
+my $bed2 = 'All_contig.bed';
+
+
+open (ASS, "<", $ass);
+open (BED, ">", $bed);
+open (MISS, ">", $missed);
+open (BED2, ">", $bed2);
+
+
+while (<ASS>) {
+  chomp (my $line = $_);
+  my $locus;
+  my $ids;
+  if ($line =~ m /^>(\S+)(_\d+)$/ ) {
+    $locus = $1 . $2;
+    $ids = $1;
+#    print $ids, "\n";
+  }
+  #elsif ($line =~ m /^>(\S+_Contig\S+_ENS\S+\d+_\S+)$/ ) {
+  #  $locus = $1;
+  #  $ids = $1;
+
+  #}
+  else {
+    next; 
+  }
+  if ($original{$ids}) {
+    my $target = 'target.txt';
+    my $query = 'query.txt';
+    my $out = 'out';
+    open (TAR , ">", $target);
+    open (QUERY, ">", $query);
+    
+    print TAR ">",$ids,"\n";
+    print TAR $original{$ids}, "\n";
+    print QUERY $line, "\n";
+    chomp (my $seq = <ASS>);
+    print QUERY $seq, "\n";
+    print BED2 $locus , "\t", "0", "\t", length ($seq), "\n";
+
+    system ("makeblastdb -in $target -dbtype nucl");
+    system ("blastn -db $target -query $query -evalue 1e-20 -outfmt 6 -out $out");
+    unlink ($target, $query);
+    if (-e $out) {
+      open (BLAST, "<", $out);
+      while (<BLAST>) {
+	chomp (my @line = split /\s+/, $_);	
+	print BED $locus , "\t", $line[6]-1, "\t", $line[7]-1, "\n" if ($line[7] > $line[6]);
+	print BED $locus , "\t", $line[7]-1, "\t", $line[6]-1, "\n" if ($line[6] > $line[7]);
+	last;
+      }
+    }
+    if (-z $out) {
+      print MISS $line, "\n";
+      
+    }
+    close BLAST;
+  } ##if ($original{$ids}) {
+} ##while (<ASS>) {
+
+close BED;
+close MISS;
+close BED2;
+   
+}
+
+
+sub summary {
+  die(qq/
+
+9-preFiltering summary [options] 
+
+options:
+-p  FILE   pileup
+-o  FILE   results
+-n  INT    sample size
+-c  INT    1=coverage 
+           2=base reads 
+           3=quality score
+
+\n\n/) unless (@ARGV);
+  
+  
+  my %opts = (p=>undef, o=>undef, n=>undef, c=>undef);
+  getopts('p:n:o:c:', \%opts);
+  
+  
+  my $sites = 0;
+  my @cover = (0,1); 
+  
+  open(PILEUP, "<", $opts{p}); # open pileup files
+  open(OUT, ">", $opts{o}); # output file
+  
+  numb_sites($sites); # number of sites in input pileup
+  close PILEUP;
+
+  if ($opts{c} eq 1) {
+    coverage_index($opts{n}, \@cover); # adds coverage columns to list of pileup columns 
+  }
+  elsif ($opts{c} eq 2) {
+    base_index($opts{n},\@cover); # adds base columns to list of pileup columns
+  } 
+  elsif ($opts{c} eq 3) {
+    quality_index($opts{n},\@cover); #adds quality score columns to list of pileup columns
+  }
+  
+
+  sub numb_sites {
+    my $sites =@_;
+    while (<PILEUP>) { 
+      $sites++;
+    }
+  }
+  
+  
+  sub coverage_index { 
+    my ($n, $cover)=@_;
+    my @cover = @{$cover};
+    my $i; 
+    for ($i = 1; $i <= $n; $i++) {
+      push @cover, (3 + 3*($i-1));
+    } 
+  }
+  
+  sub base_index { 
+ my ($n, $cover)=@_;
+    my @cover = @{$cover};
+    my $i; 
+    for ($i = 1; $i <= $n; $i++) {
+      push @cover, (4 + 3*($i-1));
+    } 
+  }
+  
+  sub quality_index { 
+    my ($n, $cover)=@_;
+    my @cover = @{$cover};
+    my $i; 
+    for ($i = 1; $i <= $n; $i++) {
+      push @cover, (5 + 3*($i-1));
+    } 
+  }
+  
+  
+  open(PILEUP, "<", $opts{p}); # open pileup files
+  
+  if ($opts{c} eq 1) { # write coverage to output - last column is total coverage for site
+    while (<PILEUP>) {
+      my @cols = split("\t", $_);	
+      my @select = @cols[@cover];
+      
+      my $length = @select;
+      
+      my $i;	
+      my $sum;	
+      foreach $i (@select[2 .. ($length - 1)]) {
+	
+	$sum += $i;
+      }
+      print OUT "@select $sum\n"; 
+      
+      
+    }
+  } elsif ($opts{c} eq 2) { # write bases 
+    while (<PILEUP>) {
+      my @cols = split("\t", $_);
+      my $divide = join("|", @cols[@cover]);	
+      print OUT "$divide\n";
+    }
+  } elsif ($opts{c} eq 3) { # write quality scores
+    while (<PILEUP>) {
+      my @cols = split("\t", $_);
+      print OUT "@cols[@cover]\n";
+    }
+  }
+  
+  close PILEUP;
+  close OUT;
+  
+}
+

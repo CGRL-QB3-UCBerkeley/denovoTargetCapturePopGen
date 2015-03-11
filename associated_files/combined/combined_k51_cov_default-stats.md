@@ -1,0 +1,5 @@
+n     |n:500  |n:N50  |min  |N80  |N50  |N20   |E-size  |max   |sum   |name
+---   |---    |---    |---  |---  |---  |---   |---     |---   |---   |---
+4018  |3      |2      |508  |508  |732  |1006  |804     |1006  |2246  |/home/ke/Desktop/SeqCap/data/raw_assembly/results/combined/combined_k51_cov_default-unitigs.fa
+4018  |3      |2      |508  |508  |732  |1006  |804     |1006  |2246  |/home/ke/Desktop/SeqCap/data/raw_assembly/results/combined/combined_k51_cov_default-contigs.fa
+4018  |3      |2      |508  |508  |732  |1006  |804     |1006  |2246  |/home/ke/Desktop/SeqCap/data/raw_assembly/results/combined/combined_k51_cov_default-scaffolds.fa

@@ -1,0 +1,813 @@
+#!/usr/bin/perl
+use warnings;
+use strict;
+use List::Util qw(max min);
+use Getopt::Std;
+use File::Basename;
+use File::Temp;
+use List::Util qw(sum);
+#############################################################################################
+# a script to find assembled contigs that match to a given target, accounting for the fact  #
+# that one target might have multiple contigs that match and that one contig might have     # 
+# multiple targets that match                                                               #
+#                                                                                           #
+# requires blastn & formatdb & cd-hit-est, all in path                                      #              
+#                                                                                           #
+# v 1.6, fixed error in how blast output file is defined                                    #               
+# written by Sonal Singhal, sonal [dot] singhal 1 [at] gmail [dot] com, 23 Jan 2013         #
+# last modified by Ke Bi 20 Nov 2014                                                        #
+# Assume that in the original target: transcript target or one exon per transcriprt         #
+#############################################################################################
+
+
+
+die(qq/
+5-FindingTargets [options] 
+
+external dependencies: blastn, makeblastdb, cd-hit-est
+
+
+options:
+
+-t  FILE     Target sequence file
+-a  DIR      A folder with all final assemlies 
+-m  FLOAT    How much should you cluster the targets and 
+             assemblies at the get go [0.98]
+-d  FLOAT    How much overlap is allowed between adjoining 
+             assembled contigs mapping to the same target [0.5]
+-p  INT      How similar does the assembled contig have to
+             be to the target (note this is out of 100) [90]
+-M  INT      memory needed for cdhit [4000]
+-E  FLOAT    Used in the initial BLAST step [1e-20]
+-f  INT      offset bp you would like to add onto the coordinate [100]   
+
+\n\n/) unless (@ARGV);
+
+
+my %opts = (t=>undef, a=>undef,  m=>0.98, d=>0.5, p=>90, E=>1e-20, M=>4000, f=>100);
+getopts('a:t:m:d:p:E:M:', \%opts);
+
+
+my $oriref = $opts{t};
+my $cluster = $opts{m}; #how much should you cluster the targets and assemblies at the get go
+my $maxOverlap =$opts{d}; #how much overlap is allowed between adjoining assembled contigs mapping to the same target
+my $perMatch = $opts{p};#how similar does the assembled contig have to be to the target (note this is out of 100)
+my $eval = $opts{E}; #used in the initial BLAST step
+my $offset = $opts{f};
+my $dir;
+
+if ($opts{a} =~ m/\/$/ ){
+  $dir = $opts{a}; 
+}
+else {
+  $dir = $opts{a} . "/";
+}
+
+
+my @files = <$dir*.fasta.final> or die "can not find the merged assemblies!\n";
+
+my $resdir = $dir . "In_target/";
+mkdir $resdir unless -e $resdir;
+
+my $seqfile = $oriref . "_rename";
+my $corres = $oriref . "_rename_compared.txt";
+
+my %ref;
+my $d = 0;
+my $id;
+open (IN, "<", $oriref);
+while (<IN>) {
+  chomp (my $line = $_);
+  if ($line =~ m/^>(\S+)/) {
+    $id = $1;
+    $d++;
+  }
+  else {
+    $ref{$d}{'id'} = $id;
+    $ref{$d}{'seq'} .= $line;
+  }
+  
+}
+close IN;
+
+open (OUT1, ">", $seqfile);
+open (OUT2, ">", $corres);
+foreach my $d (sort {$a <=> $b} keys %ref) {
+  print OUT1 ">Contig" , $d, "\n";
+  print OUT1 $ref{$d}{'seq'}, "\n";
+  print OUT2 ">Contig" , $d, "\t", $ref{$d}{'id'},"\n";
+   
+}
+close OUT1;
+close OUT2;
+
+foreach (@files) {
+  my $assembly = $_;
+  my $lib = $1 if basename ($assembly) =~ m/(\S+)\.fasta/;
+  my $finalSeq = $resdir . $lib . "_intargetPremasked.fa";
+  my $errorFile = $resdir . $lib . "_intarget.sensitivity";
+  
+  open(SEQ, ">$finalSeq");
+  open(ERR, ">$errorFile");
+  
+  my $call1 = system("cd-hit-est -i $seqfile -M $opts{M} -o tmp -c $cluster");
+  my $call2 = system("mv tmp $seqfile");
+  my $call3 = system("cd-hit-est -i $assembly -M $opts{M} -o tmp -c $cluster");
+  my $call4 = system("mv tmp $assembly");
+  my $call5 = system("rm tmp*");
+  my $call6 = system("makeblastdb -in $seqfile -dbtype nucl");
+  my $out = $resdir . $lib. "_blast.out";
+  my $call7 = system("blastn -query $assembly -db $seqfile -out $out -evalue $eval -outfmt 6");
+  #system ("cp $out tmp");
+  
+  my %tmp;
+  open(IN, "<$out");
+  while (<IN>) {
+    chomp(my $line = $_);
+    my @d = split(/\t/,$line);
+    
+    push(@{$tmp{$d[0]}},\@d) if $d[2] >= $perMatch && $d[3] >= 50;
+  }
+  close(IN);
+   system ("rm $out");
+  
+  my %matches;
+  foreach my $id (keys %tmp) {	
+    my $mArray = removeOverlap1($tmp{$id});
+    my @mArray = @{$mArray};
+    for (my $i = 0; $i < scalar(@mArray); $i++) {
+	push(@{$matches{$mArray[$i][1]}}, \@{$mArray[$i]});
+      }
+  }	
+  undef %tmp;	
+  
+  foreach my $id (keys %matches) {
+    my $mArray = removeOverlap(\@{$matches{$id}});
+    $matches{$id} = $mArray;
+  }
+  
+  my $seq = readSeq($seqfile); 
+
+  my %seq = %{$seq};
+  
+  my $contigs = readSeq($assembly);
+  my %contigs = %{$contigs};	
+  
+  my %print;	
+  foreach my $id (keys %seq) {
+    if ($matches{$id}) {
+      my %length;
+      for (my $i = 0; $i < scalar(@{$matches{$id}}); $i++) {
+	my $start = $matches{$id}[$i][8];
+	my $end = $matches{$id}[$i][9];
+	for (my $n = min($start,$end); $n <= max($start,$end); $n++) {
+	  $length{$n}++;
+	}			
+	$print{$matches{$id}[$i][0]}{$id}++;
+      }
+      my $overlap = sprintf("%.3f",scalar(keys %length) / length($seq{$id}));	
+      print ERR $id, "\t", $overlap, "\n";	
+    }
+    else {
+      #print SEQ ">", $id, "\n", $seq{$id}, "\n";
+      print ERR $id, "\t", "NA\n";
+    }
+  }	
+  
+  my %ids;	
+  foreach my $c (keys %print) {
+    my $newid = join("_", keys %{$print{$c}}) . "_1";
+    if ($ids{$newid}) {
+      $ids{$newid}++;	
+      if ($newid =~ m/(\S+)_(\d*)/) {
+	my $core = $1;
+	my $no = $ids{$newid};
+	$newid  = $core . '_' . $no;
+      }
+    }
+    else {
+      $ids{$newid}++;
+    }	
+    print SEQ ">", $newid, "\n", $contigs{$c}, "\n"; 
+  }
+  close ERR; close SEQ;	
+
+  self ($finalSeq, $resdir, $lib, $seqfile);  
+}
+
+
+sub self {
+ 
+  my ($new_master, $resdir, $name, $ref) = @_;
+  
+  my $hash = seqhash($new_master);#no chemric sequences included
+  
+  my %Nochem = %{$hash};
+ 
+   
+   
+  
+  my $final1 = $resdir . $name . "_noChem.fasta";
+  open (OUT , ">", $final1);
+  foreach my $id (sort {$a cmp $b} keys %Nochem) {
+    print OUT ">", $id, "\n";   
+    print OUT $Nochem{$id}{'seq'}, "\n";
+  }
+  close OUT;
+  unlink ($new_master);
+  
+  my $dd;
+  my %ref;
+  my $idcontig;
+  open (IN, "<", $ref);
+  while (<IN>) {
+    chomp (my $line = $_);
+    
+    if ($line =~ m/^>(\S+)/) {
+$dd++;
+      $idcontig = $1; 
+ 
+    }
+    else {
+      $ref{$idcontig} .= $line;
+    }
+    
+  }
+  close IN;
+  print $dd,"\n";
+  
+
+  my $final2 = $final1 . "_copy";
+  system ("cp $final1 $final2" );
+  my $blastout = $resdir . $name .'.blast.out';
+  my $call1 = system("makeblastdb -in $final1 -dbtype nucl > log");
+  my $call2 = system("blastn -db $final1 -query $final2 -evalue 1e-10 -outfmt 6 -out $blastout");
+  system("rm $final1.n* $final2 log");
+  
+  my $hash1 = readSeq($final1);#no chemric sequences included
+  unlink ($final1);
+  my %seq = %{$hash1};
+  
+  my %tmp;
+  open(IN, "<$blastout");
+  while (<IN>) {
+    chomp(my $line = $_);
+    my @d = split(/\s+/,$line);
+    push(@{$tmp{$d[0]}},\@d);
+  }
+  close(IN);
+  system ("rm $blastout");
+
+  foreach my $id (sort {$a cmp $b} keys %tmp) {
+      if (scalar(@{$tmp{$id}}) > 1 ) {
+	for (my $i = 1; $i < scalar(@{$tmp{$id}}); $i++) {  # from the second match. The first match is itself 
+
+	  my $start1;
+	  my $end1;
+	  my $start2; 
+	  my $end2; 
+	  if ($tmp{$id}[$i][6] < $tmp{$id}[$i][7]) {	    
+	    $start1 = $tmp{$id}[$i][6];
+	    $end1 = $tmp{$id}[$i][7];
+	  }
+	   if ($tmp{$id}[$i][6] > $tmp{$id}[$i][7]) {	    
+	    $start1 = $tmp{$id}[$i][7];
+	    $end1 = $tmp{$id}[$i][6];
+	  }
+	  
+	  if ($tmp{$id}[$i][8] < $tmp{$id}[$i][9]) {	    
+	    $start2 = $tmp{$id}[$i][8];
+	    $end2 = $tmp{$id}[$i][9];
+	  }
+	   if ($tmp{$id}[$i][8] > $tmp{$id}[$i][9]) {	    
+	    $start2 = $tmp{$id}[$i][9];
+	    $end2 = $tmp{$id}[$i][8];
+	  }
+	  
+	  	  
+	  my $seq1 = $seq{$tmp{$id}[$i][0]}  ;
+	  my $seq2 = $seq{$tmp{$id}[$i][1]}  ;
+	 
+	  substr ($seq1, $start1-1, $end1-$start1+1) = "n" x length (substr ($seq1, $start1-1, $end1-$start1+1)) ;
+	  substr ($seq2, $start2-1, $end2-$start2+1) = "n" x length (substr ($seq2, $start2-1, $end2-$start2+1)) ;
+	  
+	  $seq{$tmp{$id}[$i][0]} = $seq1 ;  
+	  $seq{$tmp{$id}[$i][1]} = $seq2 ;
+	  
+	}
+      }
+    }
+ 
+    
+
+
+
+  my %exon_only;
+  my %data;
+  my %everything;
+  my $Ns = 'NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN';
+  my $lengths = length ($Ns);
+  my %position;
+
+
+  my $ddd;
+  foreach my $contig (sort {$a cmp $b} keys %ref) {
+    print $contig, "\n";
+    $ddd++;
+    my $final3 = $resdir . $name . "_" . $contig . "_target.fasta";
+    
+    my $ref = $resdir . $name . "_" . $contig . "_ref.fasta";
+    open (TAR, ">", $final3);
+    open (REF, ">", $ref);
+    print REF ">", $contig, "\n";
+    print REF $ref{$contig},"\n";
+    
+    my $yes = 0;
+    foreach my $id (sort {$a cmp $b} keys %seq) { 
+      my $seqid = $1 if $id =~ m/(\S+)_\d+/;
+      if ($contig eq $seqid) { 
+	print TAR ">",$id, "\n";
+	print TAR $seq{$id}, "\n";
+	$yes++;
+      }
+    }
+    close REF;
+    close TAR;
+  
+    unlink ($final3, $ref) if $yes == 0;
+    
+    if ($yes > 0) {
+      
+      my $BEDblastout = $resdir . $name . "_" . $contig .'.blastBED.out';
+      my $BEDblastout1 = $resdir . $name . "_" . $contig .'.blastBED.out.sorted';
+      my $call5 = system("makeblastdb -in $final3 -dbtype nucl > log");
+      my $call6 = system("blastn -db $final3 -query $ref -evalue $eval -outfmt 6 -out $BEDblastout ");
+      system("rm $final3.n*  log");
+      system ("sort -k 1,1 -k 7n,12 $BEDblastout > $BEDblastout1");
+      
+      open (IN, "<", $BEDblastout1);
+      unlink ($final3, $ref);
+      unlink ($BEDblastout, $BEDblastout1);
+
+      my $count =0;
+      while (<IN>) {
+       $count++;		
+      }	
+      seek IN, 0, 0;
+   
+      print $contig, "_no!!!!" , "\n" if $count == 0;
+      next if $count == 0;
+
+      if ($count == 1) {
+      chomp (my $first = <IN>);
+      my @a = split /\s+/,$first;
+        my $refContig = $a[0];
+	my $assContig = $a[1];
+	my $start; 
+	my $end;  
+        my $seqw;
+	if ($a[8] > $a[9]) {
+	  $start = $a[9];
+	  $end = $a[8]; 
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);        
+	  $exon_only{$assContig} = reverse($exon_only{$assContig});
+	  $exon_only{$assContig} =~ tr/ATGC/TACG/;	  
+	  $seqw = $seq{$assContig};
+          $seqw  = reverse($seqw );
+	  $seqw  =~ tr/ATGC/TACG/;		  
+	}
+	else {
+	  $start = $a[8];
+	  $end = $a[9]; 
+          $seqw = $seq{$assContig};   
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);     
+	}
+          
+        $everything{$contig}{'seq'} .= $seqw;
+	close IN;
+      } ##if ($count == 1)
+      
+      if ($count > 1) {
+      chomp (my $first = <IN>);
+      my @a = split /\s+/,$first;
+        my @prev; 
+        my $refContig = $a[0];
+	my $assContig = $a[1];
+	my $start; 
+	my $end;  
+	push @prev, $assContig;
+	my $seqw;		
+
+
+        
+        if ($a[8] > $a[9]) {
+	  $start = $a[9];
+	  $end = $a[8]; 
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);        
+	  $exon_only{$assContig} = reverse($exon_only{$assContig});
+	  $exon_only{$assContig} =~ tr/ATGC/TACG/;	  
+	  $seqw = $seq{$assContig};
+          $seqw  = reverse($seqw );
+	  $seqw  =~ tr/ATGC/TACG/;	  
+	}
+	else {
+	  $start = $a[8];
+	  $end = $a[9];    
+          $seqw = $seq{$assContig};
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);     
+	}
+          
+        $everything{$contig}{'seq'} .= $seqw . $Ns;
+    
+      my $Co_Num;
+      my $dd = 1;
+
+      while (<IN>) {
+	chomp (my @a = split /\s+/, $_);
+	my $refContig = $a[0];
+	my $assContig = $a[1];
+	my $start; 
+	my $end;
+        $Co_Num = $assContig;
+      
+	if ($a[8] >$a[9]) {
+	  $start = $a[9];
+	  $end = $a[8]; 
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);        
+	  $exon_only{$assContig} = reverse($exon_only{$assContig});
+	  $exon_only{$assContig} =~ tr/ATGC/TACG/;	  
+	  $seqw = $seq{$assContig};
+          $seqw  = reverse($seqw );
+	  $seqw  =~ tr/ATGC/TACG/;	  
+	}
+	else {
+	  $start = $a[8];
+	  $end = $a[9];
+          $seqw = $seq{$assContig};    
+	  $exon_only{$assContig} = substr ($seq{$assContig}, $start-1, $end-$start+1);     
+	}
+	
+	unless ($Co_Num ~~ @prev) {
+                  print $Co_Num, "\t\t\t\t\t", join ("\t", @prev), "\n";
+	        if ($dd < $count-1) {
+	        $everything{$contig}{'seq'} .= $seqw. $Ns;
+               
+                
+	        }
+	        if ($dd == $count-1) {
+	        $everything{$contig}{'seq'} .= $seqw;
+	        }
+         $dd ++;
+        }
+        if ($Co_Num ~~ @prev) {
+
+           if ($dd == $count-1) {
+	    $everything{$contig}{'seq'} = substr $everything{$contig}{'seq'}, 0, -$lengths; 
+	   } 
+	   $dd ++;	
+	}         
+
+
+         push @prev, $Co_Num;	
+
+  
+      }
+      close IN;
+     }
+	
+    my $final4 = $resdir . $name . "_" . $contig . "_target.fasta1";
+    my $ref4 = $resdir . $name . "_" . $contig ."_ref.fasta1";
+    open (TAR, ">", $final4);
+    open (REF, ">", $ref4);
+    print REF ">", $contig, "\n";
+    print REF $ref{$contig},"\n";
+
+    print TAR ">",$contig . "_ass", "\n";
+    print TAR $everything{$contig}{'seq'}, "\n";
+	
+    close REF;
+    close TAR;       
+      my $BEDblastout3 = $resdir . $contig .'.blastBED.out1';
+      my $BEDblastout4 = $resdir .  $contig .'.blastBED.out.sorted1';
+      system("makeblastdb -in $final4 -dbtype nucl > log");
+      system("blastn -db $final4 -query $ref4 -evalue $eval -outfmt 6 -out $BEDblastout3 ");
+      system("rm $final4.n*  log");
+      system ("sort -k 1,1 -k 7n,12 $BEDblastout3 > $BEDblastout4");
+      
+      open (IN2, "<", $BEDblastout4);
+      unlink ($BEDblastout3, $BEDblastout4);
+      unlink ( $final4, $ref4); 
+      
+       while (<IN2>) {
+	chomp (my @a = split /\s+/, $_);
+	my $refContig = $a[0];
+	my $start = $a[8]; 
+	my $end = $a[9];
+
+        print 	$contig if     ($start > $end);
+        print "yes", "\n" if     ($start > $end);
+        exit if ($start > $end);
+       
+        push @{$position{$refContig}}, $start, $end if ($start < $end);
+      }
+      close IN2;
+    }    ##yes=1;
+  }
+    
+print $ddd, "\n";
+
+
+ 
+  
+  #my $exonOUT =  $resdir . $name .'_targetedRegionONLY.fasta';
+  my $AllOUT  =  $resdir . $name .'_targetedRegionAndFlanking.fasta';
+  my $AllBed  =  $resdir . $name .'_targetedRegionAndFlanking.bed';
+  my $All_Contig_bed = $resdir . $name .'_contig.bed'; 	 
+  
+  open (ALLC, ">", $All_Contig_bed);
+  open (ALL, ">", $AllOUT);
+  open (BED, ">", $AllBed);
+  
+   foreach my $item (sort {$a cmp $b} keys %everything) {
+    print ALL ">", $name, "_", $item, "\n";
+    print ALLC $name, "_", $item, "\t", "0", "\t", length ($everything{$item}{'seq'}), "\n";
+    print ALL $everything{$item}{'seq'}, "\n";
+    
+  }
+  close ALL;
+  close ALLC;
+
+  
+
+
+  foreach my $item (sort {$a cmp $b} keys %position) {
+    for (my $i = 0 ; $i < scalar @{$position{$item}}; $i=$i+2 ) {
+      print BED $name, "_", $item, "\t";
+      print BED $position{$item}[$i]-1, "\t", $position{$item}[$i+1],"\n";
+    }
+  }
+  close BED;
+  MakeBed ($AllBed, $offset);
+}
+
+#curse the recursive function!
+sub removeOverlap {
+  my ($array) = @_;
+  
+  for (my $i = 0; $i < scalar(@$array); $i++) {
+    my $start1 = $array->[$i]->[8];
+    my $end1 = $array->[$i]->[9];
+    my %bp;
+    for (my $n = min($start1,$end1); $n <= max($start1,$end1); $n++) {
+      $bp{$n}++;
+    }
+    for (my $j = $i+1; $j < scalar(@$array); $j++) { 	
+      my $start2 = $array->[$j]->[8];
+      my $end2 = $array->[$j]->[9];
+      my $overlap = 0;
+      for (my $n = min($start2,$end2); $n <= max($start2,$end2); $n++) {
+	$overlap++ if $bp{$n};
+      }
+      $overlap = $overlap / min(abs($start1 - $end1),abs($start2 - $end2));	
+      if ($overlap > $maxOverlap) {
+	if (abs($start1 - $end1) < abs($start2 - $end2)) {
+	  splice(@$array,$i,1);							
+	}
+	else {
+	  splice(@$array,$j,1);
+	}	
+	removeOverlap($array);	
+      }
+    }
+  }	
+  return($array);	
+}	
+
+#curse the recursive function!
+sub removeOverlap1 {
+  my ($array) = @_;
+  
+  for (my $i = 0; $i < scalar(@$array); $i++) {
+    my $start1 = $array->[$i]->[6];
+    my $end1 = $array->[$i]->[7];
+    my %bp;
+    for (my $n = min($start1,$end1); $n <= max($start1,$end1); $n++) {
+      $bp{$n}++;
+    }
+    for (my $j = $i+1; $j < scalar(@$array); $j++) { 	
+      my $start2 = $array->[$j]->[6];
+      my $end2 = $array->[$j]->[7];
+      my $overlap = 0;
+      for (my $n = min($start2,$end2); $n <= max($start2,$end2); $n++) {
+	$overlap++ if $bp{$n};
+      }
+      $overlap = $overlap / min(abs($start1 - $end1),abs($start2 - $end2));	
+      if ($overlap > $maxOverlap) {
+	if (abs($start1 - $end1) < abs($start2 - $end2)) {
+	  splice(@$array,$i,1);							
+	}
+	else {
+	  splice(@$array,$j,1);
+	}	
+	removeOverlap1($array);	
+      }
+    }
+  }	
+  return($array);	
+}	
+
+sub readFile {
+  my ($file,$hash,$base) = @_;
+  if (-f $file) {
+    open(IN, "<$file");	
+    my $id; my $tracker = 1;
+    while(<IN>) {
+      chomp(my $line = $_);
+      if ($line =~ m/>(\S+)/) {
+	$id = $base . $tracker;
+	$tracker++;
+      }
+      else {
+	$hash->{$id} .= $line;
+      }
+    }
+    close(IN);	
+  }	
+  return($hash);
+}	
+
+sub readSeq {
+  my ($seqfile) = @_;
+  my %seq; my $id;
+  open(IN, "<$seqfile");
+  while(<IN>) {
+    chomp(my $line = $_);
+    if ($line =~ m/>(\S+)/) {
+      $id = $1;
+    }
+    else {
+      $seq{$id} .= $line;
+    }
+  }
+  close(IN);
+  return(\%seq);
+}
+
+
+sub seqhash {
+  my ($file) = @_;
+  my %seq;
+  open (IN, "<", $file); 
+  my $id;
+  my $d = 0;
+  while (<IN>) {
+    chomp (my $line = $_);
+    if ($line =~ m /^>(Contig\d+_\d+)$/) {   
+      $id = $1;
+      chomp (my $seq = <IN>);
+      $seq{$id}{'seq'} = $seq;
+    }
+    if ($line =~ m /^>Contig\d+_Contig\d+/) {
+      print $line, "\n";
+      $d++;    
+    }  
+    else {
+    next;
+    }
+  }
+  print "\n\nIn ", $file, ", " ,  $d, " chemric sequences are discarded!", "\n\n";
+  close IN;
+  return (\%seq);
+}
+
+
+sub MakeBed {
+  my ($bed, $offset) = @_;
+  open (BED, "<", $bed);
+  my @Bed;
+  my $count =0;
+  while (<BED>) {
+    chomp (my @name = split /\s+/, $_);
+    #add bed to matrix
+    
+      $Bed[$count] -> [0] = $name[0]; #contig name
+      $Bed[$count] -> [1] = $name[1]; #start coordinate
+      $Bed[$count] -> [2] = $name[2]; #end coordinate
+      $count++;
+    
+  }
+  close BED;
+  
+  @Bed = sort { $a->[0] cmp $b->[0] || $a->[1] <=> $b->[1] || $a->[2] <=> $b->[2]} @Bed; 
+
+  
+  my ($tmp_offset, $tmp);
+
+  #create temp files to save space!  
+  $tmp_offset = File::Temp->new(SUFFIX=>'.offset');
+  $tmp = File::Temp->new(SUFFIX=>'.original');
+
+  foreach (@Bed) {
+    print $tmp @{$_}[0], "\t", @{$_}[1], "\t", @{$_}[2], "\n";   
+    if (@{$_}[1] >= $offset) {
+      print $tmp_offset @{$_}[0], "\t", @{$_}[1]-$offset, "\t", @{$_}[2]+$offset, "\n";
+    }
+    else {
+      print $tmp_offset @{$_}[0], "\t", 0, "\t",  @{$_}[2]+$offset, "\n";
+    }
+  }
+  
+  seek $tmp, 0, 0; #rewind $region list to beginning for main loop
+  seek $tmp_offset, 0, 0;
+  
+  my $out1 = $bed . "_offset_final";
+  mining ($tmp_offset, $out1);
+  my $out2 = $bed . "_final";
+  mining ($tmp, $out2);
+  unlink ($tmp_offset, $tmp);
+  system ("mv $out2 $bed");
+  
+  sub mining {
+    my ($file, $out) = @_;
+    open (IN, "<", $file);
+    open (OUT, ">", $out);
+    
+    chomp (my $first = <IN>);
+    my @d = split /\s+/, $first;
+    
+    my $gene = $d[0];
+    my $start = $d[1];
+    my $end = $d[2];
+    
+    while (<IN>) { ##do not forget to process the end of file!!
+      
+      chomp (my @line = split /\s+/, $_);
+      if ($line[0] eq $gene) {
+	
+	if (!eof){ ## if not the end of the file
+	  
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    $start = $line[1];
+	    $end = $line[2];
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	 	  
+	  }
+	  if ($line[1] < $start) {
+	    $start = $line[1];
+	    if ($line[2] >= $end) {
+	      $end = $line[2];	  
+	    }	  
+	  }
+	}
+	
+	else { #end of the file; need to print both lines. Same as below
+	  if ($line[1] > $end) {
+	    print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	  } 	
+	  if ($line[1] <= $end && $line[1] >= $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $start, "\t", $line[2], "\n";	      
+	    } 
+	    else {
+	      print OUT $gene, "\t", $start, "\t", $end, "\n";
+	    }
+	  }
+	  if ($line[1] < $start) {
+	    if ($line[2] >= $end) {
+	      print OUT $gene, "\t", $line[1], "\t", $line[2], "\n";
+	    }
+	    else {
+	      print OUT $gene, "\t", $line[1], "\t", $end, "\n";
+	    } 
+	  }
+	}	
+      }
+      
+      
+      if ($line[0] ne $gene) {
+	if (!eof) {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";	
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2];   
+	}
+	else {
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	  $gene = $line[0];
+	  $start = $line[1];
+	  $end = $line[2]; 
+	  print OUT $gene, "\t", $start, "\t", $end, "\n";
+	}
+      }
+    }
+    close IN;
+    close OUT;
+  } 
+}
+
+

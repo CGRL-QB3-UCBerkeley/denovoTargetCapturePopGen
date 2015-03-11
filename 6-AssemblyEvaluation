@@ -1,0 +1,1374 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use File::Temp;
+use POSIX;
+use Getopt::Std;
+use File::Basename;
+use List::Util qw[min max];
+
+
+# Modified based on Sonal Singhal's (sonal.singhal1@gmail.com) brilliant and famous *7evaluateAssembly.pl*.  
+# To use COVERAGE and FIX, you will have to generate alignment pileup output by SAMTools first
+# For questions please contact Ke Bi (kebi@berkeley.edu) 
+
+
+
+&main;
+exit;
+
+sub main {
+        &usage if (@ARGV<1);
+        my $command = shift(@ARGV);
+        my %fun = (BASIC=>\&BASIC, COVERAGE=>\&COVERAGE, FIX=>\&FIX, CEGMA=>\&CEGMA, ORF=>\&ORF, CONTIGUITY=>\&CONTIGUITY, ANNOTATABLE=>\&ANNOTATABLE, ACCURACY=>\&ACCURACY, COMPARE=>\&COMPARE, READSUSED=>\&READSUSED);
+        die("Unknown command \"$command\"\n") if (!defined($fun{$command}));
+        &{$fun{$command}};
+      }
+
+sub usage {
+  die(qq/
+Usage:  6-AssemblyEvaluation <command> [<arguments>]\n
+
+Command: 
+
+ACCURACY:       The percentage of the correctly assembled bases estimated using the set
+                of expressed reference transcripts
+
+ANNOTATABLE:    Calculates the percentage of the matches in reference. Also calculate
+                average percentage of matched bp and mismatches among the matched genes
+
+BASIC:          Reports basic stats: mean, median, total length, gc%, N50 etc. Also 
+                generates a histogram of contig lengths for each assembly (bin=100)
+
+CEGMA:          Number of hits by mapping to a set of 458 core proteins that are present
+                in a wide range of taxa
+
+COMPARE:        Compares assemblies pairwisely to report % total aligned bp, % alignment 
+                accuracy, % uniquely assembled contigs,  % shared and % uniquely assembled 
+                contigs hit reference protein database
+
+CONTIGUITY:     Calculates assembly contiguity (the percentage of expressed reference 
+                transcripts covered by a single, longest-assembled contig) and completeness
+                (the percentage of expressed reference transcripts covered by all the
+                assembled transcripts)
+
+COVERAGE:       Calculates error rate, average quality score of the aliged bases and its 
+                varinace\/std, and average base coverage. Need to do alignment first 
+
+FIX:            Fixes assembly errors
+
+ORF:            The percentage of the tested contigs (bp) that contains open reading frames 
+
+READSUSED:      Maps a subset of reads to the assembly to estimate % of reads used for making
+                these assemblies etc.
+
+\n/);
+}
+
+
+
+# %master is not used in most functions. Keep it for comparison purpose. 
+
+
+####################################################################################################################################################
+
+sub READSUSED {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation READSUSED [options]
+
+Options:
+
+-a  CHR   directory with all assemblies
+-b  CHR   directory with all libraries
+-c  INT   how many reads do you want to use for the test? [100000]
+
+Note: the naming for libraries and assemblies has to be consistent. 
+Library: ABC_1_final.txt, ABC_2_final.txt
+Assembly: ABC.fasta
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>undef, c=>100000);
+getopts('a:b:c:', \%opts);
+
+ 
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+
+my $read;
+
+if ($opts{b} =~ m/\/$/){
+$read = $opts{b}; 
+}
+else {
+$read = $opts{b} . "/";
+}
+
+
+my @assemblies = <$dir*fasta>;
+my @reads = <$read*_1_final.txt>;
+my $randomReads = $opts{c};
+
+my $out = $dir.'readsUsed.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","numReadsMatched(%)", "\t","numPairsMatched(%)", "\t", "avgDist(bp)", "\t", "chimera(%)", "\n";
+
+foreach my $file1 (@reads) {
+  my $lib = $1 if basename($file1) =~ m/(\S+)_1_final.txt/;
+  my $file2  = $read . $lib . '_2_final.txt';
+  
+  my $nLines = $randomReads * 4;
+  my $reads1 = $read . $lib. "_testReads1.fastq";
+  my $reads2 = $read . $lib. "_testReads2.fastq";
+  
+  system("head -n $nLines $file1 > $reads1");
+  system("head -n $nLines $file2 > $reads2");
+  
+  
+  foreach my $seq (@assemblies) { 
+    my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+    if ($id eq $lib) {
+       print "processing assembly ",$lib, "." , "\n";
+      readsUsed($seq,$id,$reads1,$reads2, $randomReads);
+    }
+  }
+}
+
+close OUT;
+
+
+sub readsUsed {
+	my ($seq,$id,$reads1,$reads2, $randomReads) = @_;
+	my %master;
+	my $call1 = system("bowtie-build $seq $id -q");
+	
+	my $out = "bowtie.out";
+	my $call2 = system("bowtie $id -1 $reads1 -2 $reads2 -k 1 -5 5 -3 5 --un un.fastq > $out");
+	my $totDist;
+	my $matches;
+	open(OUT2, "<$out"); 
+	while(<OUT2>) {
+		$matches++;
+		my $line1 = $_;
+		my $line2 = <OUT2>;
+		my @d1 = split(/\s+/, $line1);
+		my @d2 = split(/\s+/, $line2);
+		$totDist += abs($d1[3] - $d2[3]); 	
+		}
+	close(OUT2);
+	$master{$id}{'numPairsMatched'} = $matches / $randomReads;
+	$master{$id}{'avgDist'} = $totDist/ $matches;
+	$master{$id}{'numReadsMatched'} = $matches*2;
+	
+	my $un1 = 'un_1.fastq';
+	my $un2 = 'un_2.fastq';
+	my $un_out1 = 'un1.out';
+	my $un_out2 = 'un2.out';
+	
+	my $call3 = system("bowtie $id $un1 -k 3 --best -5 5 -3 5 > $un_out1");
+	my $call4 = system("bowtie $id $un2 -k 3 --best -5 5 -3 5 > $un_out2");
+	
+	my %r1; my %d;
+	open(IN, "<$un_out1");
+	while(<IN>) {
+		my @d = split(/\t/,$_);
+		my $id1 = $1 if $d[0] =~ m/(\S+)/;
+		$r1{$id1}{$d[2]}++;
+		$d{$d[0]}++;
+		}
+	close(IN);
+	my %r2;
+	open(IN, "<$un_out2");
+	while(<IN>) {
+		my @d = split(/\t/,$_);
+		my $id1 = $1 if $d[0] =~ m/(\S+)/;
+		$r2{$id1}{$d[2]}++;
+		$d{$d[0]}++;	
+		}
+	close(IN);
+	
+	my $chimera = 0;
+	foreach my $id (keys %r1) {
+		#potential chimera
+		my $match = 0;
+		if ($r2{$id}) {
+			foreach my $c (keys %{$r1{$id}}) {	
+				$match++ if $r2{$id}{$c}
+				}
+			$chimera++ if $match == 0;	
+			}
+		}	
+	
+	$master{$id}{'numReadsMatched'} = $master{$id}{'numReadsMatched'} + scalar(keys %d);
+	$master{$id}{'chimera'} = $chimera / ($master{$id}{'numReadsMatched'} / 2);
+	$master{$id}{'numReadsMatched'} = $master{$id}{'numReadsMatched'} / ( $randomReads * 2 );
+	
+	my $call5 = system("rm $id"."*ebwt"); 
+	print OUT $id, "\t";
+	printf OUT "%.2f", $master{$id}{'numReadsMatched'}*100;
+	print OUT "\t";
+	printf OUT "%.2f", $master{$id}{'numPairsMatched'}*100;
+	print OUT "\t";
+	printf OUT "%.2f", $master{$id}{'avgDist'};
+	print OUT "\t";
+	printf OUT "%.2f", $master{$id}{'chimera'}*100;
+	print OUT "\n";
+	
+	unlink($un1,$un2,$un_out1,$un_out2,$out);
+	}
+}
+
+####################################################################################################################################################
+
+sub COMPARE {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation COMPARE [options]
+
+Options:
+
+-a  CHR   directory with all assemblies
+-b  INT   how many assembled contigs do you want to test [1000]
+-c  FILE  protein reference
+-d  FLOAT evalue significance level when comparing two different assemblies [1e-100]
+-e  INT   number of processors for blast search? [2]
+-f  FLOAT evalue significance level when comparing refernce protein [1e-20]
+-g  INT   to see if the unique stuff is any good [100]
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>100, c=>undef, d=>1e-100, e=>2, f=>1e-20,g=>100);
+getopts('a:b:c:d:e:f:g:', \%opts);
+
+ 
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+my $testSet = $opts{g};
+my $prot_db = $opts{c};
+my $evalue1 = $opts{d};
+my $evalue2 = $opts{f};
+my $proc = $opts{e};
+my @assemblies = <$dir*fasta>;
+my $contigs = $opts{b};
+my $out = $dir.'compareAssemblies.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","totAl(%)", "\t","accuracy(%)","\t","unique(%)", "\t","shared(%)","\t","legitUniq(%)", "\n";
+foreach my $seq (@assemblies) {	
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  my $random1 = bootstrap($seq,$contigs);
+  print "start processing assembly $id!", "\n";
+  foreach my $seq2 (@assemblies) {
+    if ($seq2 ne $seq) {
+      compare($id,$seq2,$seq,$random1,$evalue1,$prot_db, $proc, $evalue2,$contigs,$testSet);
+     
+    }
+  }	  
+}
+close OUT;
+
+#my $out2 = $dir.'compareAssemblies_final.out';
+#open (IN1, "<", $out);
+#open (OUT1, ">", $out2);
+#my $header = <IN1>;
+#print OUT1 "Assemblies", "\t","totAl(%)", "\t","accuracy(%)","\t","unique(%)", "\t","legitUniq(%)", "\n";
+#foreach (<IN1>) {
+#  chomp (my @line1 = split /\t/, $_);
+#  my $lib1 = $1 if $line1[0] =~ m/(\S+)_vs_(\S+)/;
+#  my $lib2 = $2;
+#  my $next = $lib2 . "_vs_" .  $lib1;
+#  print OUT1 join ("\t", @line1), "\n";
+  
+#  open (IN2, "<", $out);
+#  foreach (<IN2>) {
+#    chomp (my @line2 = split /\t/, $_);
+#    if ($line2[0] eq $next ) {
+#      print OUT1 $next, "\t", "NA","\t", "NA", "\t", $line2[3], "\t", $line2[4], "\n";
+#      last;
+#    }
+#  }
+#}
+#close IN1;
+#close IN2;
+#close OUT1;
+
+
+sub compare {
+  my ($id,$a1,$a2,$random,$evalue1,$prot_db, $proc, $evalue2,$contigs,$testSet) = @_;
+  my %master;
+  my %seq;
+  #$a1 = $seq2;
+  #$a2 = $seq;
+  open(IN, "<$a1");
+  my $c;
+  while(<IN>) {
+		chomp(my $line = $_);
+		if ($line =~ m/>(\S+)/) {
+			$c = $1;
+			}
+		else {
+			$seq{$c} .= $line;
+			}
+		}
+	close(IN);	
+
+	my %rand;
+	my $temp1 = "randomSeq.fa";
+	open(OUT3, ">$temp1");
+	for (my $i = 0; $i < scalar(@{$random}); $i++) { 
+		print OUT3 ">contig", $i, "\n", $random->[$i], "\n";
+		$rand{'contig' . $i} = $random->[$i];
+		}
+	close(OUT3);
+
+	my $db = $1 if basename($a1) =~ m/(\S+).fasta/i;
+	my $out = $id . $db . ".out";
+	my $blatCall = system("blat $a1 $temp1 $out -noHead -out=blast8");
+	open(IN, "<$out");
+	my %match;
+	while(<IN>) {
+		chomp(my $line = $_);
+		my @d = split(/\t/,$line);
+		#match already exists
+		if ($match{$d[0]}) {
+			#continuing the best part match
+			if ($d[1] eq $match{$d[0]}{'match'}) {
+				$match{$d[0]}{'error'} += ($d[4] + $d[5]);
+				$match{$d[0]}{'al'} += $d[3];
+				}	
+			}
+		#either a new match or a contig for which there isn't a good match	
+		else {
+			if ($d[10] < $evalue1) {
+				$match{$d[0]} = { 'match' => $d[1] , 'error' => ($d[4] + $d[5]), 'al' => $d[3] }; 
+				}
+			}
+		}
+	close(IN);	
+	
+	my $accuracy; my $totLength; my $totAl;	my $numSeq = scalar( keys %{$seq{$a2}});
+	foreach my $c (keys %match) {
+		$accuracy += $match{$c}{'error'};
+		$totLength += $match{$c}{'al'};	
+		#$totAl += ($match{$c}{'al'} * 2) / ( length($seq{$match{$c}{'match'}}) + length($rand{$c})); #$totAl is defined confusingly. Sonal, what you want to do here?
+		$totAl += ($match{$c}{'al'}) / (length($rand{$c}));
+		delete($rand{$c});
+		}
+	$totAl = $totAl / ( scalar(keys %match) );
+	$accuracy = 1 - ($accuracy / $totLength);
+	my $unique = ($contigs - scalar(keys %match)) / $contigs; 
+        my $shared = scalar(keys %match) / $contigs;
+
+	my $legitUniq = 'NA';
+	unless (scalar(keys %rand) < 10) {
+		my $testUnique = 'testUnique.fa';
+		open(OUT2, ">$testUnique");
+		my @uniq = keys %rand;
+		for (my $i = 0; $i < $testSet; $i++) {
+			print OUT2 ">contig" . "$i" . "\n" . $rand{$uniq[int rand($#uniq)]} . "\n";
+			}
+		close(OUT2);
+
+		unless (-f $prot_db . ".pin") {
+			my $call = system("makeblastdb -in $prot_db -dbtype prot");
+			}
+		my @call = `blastall -p blastx -d $prot_db -i $testUnique -m 8 -a $proc -b 1 -e $evalue2 | cut -f 1 | uniq`;
+		$legitUniq = scalar(@call)/$testSet;
+		unlink($testUnique); 
+		}	
+
+	$master{$id}{$db . '.totAl'} =  $totAl;
+	$master{$id}{$db . '.accuracy'} =$accuracy;
+	$master{$id}{$db . '.unique'} = $unique;
+	$master{$id}{$db . '.legitUniq'} = $legitUniq;
+	
+	unlink($out); unlink($temp1);
+  
+  print OUT $id,"_vs_",$db, "\t";
+  printf OUT "%.2f",$totAl*100; 
+  print OUT "\t";
+  printf OUT "%.2f",$accuracy*100; 
+  print OUT "\t";
+  printf OUT "%.2f",$unique*100;
+  print OUT "\t";
+  printf OUT "%.2f",$shared*100;
+  print OUT "\t";
+  printf OUT "%.2f",$legitUniq*100;
+  print OUT "\n";
+}
+
+}
+
+
+
+
+####################################################################################################################################################
+
+
+sub ACCURACY {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation ACCURACY [options]
+
+Options:
+
+-a  CHR   directory with all assemblies
+-b  INT   how many assembled contigs do you want to test [1000]
+-c  FILE  protein reference
+-d  FLOAT evalue significance level when comparing to reference cDNA [1e-20]
+-e  INT   number of processors for blast search? [4]
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>100, c=>undef, d=>1e-20, e=>2);
+getopts('a:b:c:d:e:', \%opts);
+
+ 
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+my $prot_db = $opts{c};
+my $evalue2 = $opts{d};
+my $proc = $opts{e};
+my @assemblies = <$dir*fasta>;
+my $testSet = $opts{b};
+my $out = $dir.'accuracy.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","stop codon(%)", "\t","gaps(%)", "\n";
+foreach my $seq (@assemblies) {	
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  my $random2 = bootstrap($seq,$testSet);
+  print "start processing assembly $id!", "\n";
+  acc($id,$random2,$prot_db, $evalue2, $proc);	  
+}
+close OUT;
+
+
+sub acc {
+	my ($id,$random, $prot_db, $evalue2, $proc) = @_;		
+	my %master;
+	my $temp1 = 'query.fa';
+	open(OUT2, ">$temp1");
+	for (my $i = 0; $i < scalar(@{$random}); $i++) { 
+		print OUT2 ">contig", $i, "\n", $random->[$i], "\n";
+		}
+	close(OUT2);
+
+	unless (-f $prot_db . ".pin") {
+		my $call = system("makeblastdb -in $prot_db -dbtype prot");
+		}
+	
+	my @call = `blastall -p blastx -d $prot_db -i $temp1 -m 8 -a $proc -b 1 -e $evalue2`;
+	
+	my %a; my $gap = 0; my $stop = 0;
+	foreach my $line (@call) {
+		my @d = split(/\t/,$line);
+		unless($a{$d[0]}) {
+			$a{$d[0]}++; my $subseq;
+			if ($d[6] < $d[7]) {
+				my $start = $d[6] - 1;
+				my $length = $d[7] - $d[6] + 1;
+				$subseq = substr $random->[$1], $start, $length if $d[0] =~ m/contig(\S+)/;
+				}
+			else {
+				my $start = $d[7] - 1;
+				my $length = $d[6] - $d[7] + 1;
+				$subseq = substr $random->[$1], $start, $length if $d[0] =~ m/contig(\S+)/;
+				$subseq = reverse($subseq); 
+				$subseq =~ tr/atgcATGC/tacgTACG/;
+				}			
+			#check to see if there looks to be a gap
+			$gap++ if length($subseq) % 3; 
+			#check to see if there is a nonsense mutation
+			my $stop1 = (translate($subseq) =~ tr/\*/\*/);
+			$stop++ unless($stop1 == 0);
+			}
+		}
+		
+	$master{$id}{'nonsenseMu'} = $stop/scalar(keys %a); 
+	$master{$id}{'gapMu'} = $gap/scalar(keys %a);
+	unlink($temp1);
+	print OUT $id, "\t";
+	printf OUT  "%.3f", $master{$id}{'nonsenseMu'}*100;
+	print OUT "\t";
+        printf OUT  "%.3f",  $master{$id}{'gapMu'}*100;
+	print OUT "\n";
+	}
+}
+
+
+
+
+####################################################################################################################################################
+
+sub ANNOTATABLE {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation ANNOTATABLE [options]
+
+Options:
+
+-a  CHR   directory with all assemblies
+-b  INT   how many cDNA sequences do you want to test [1000]
+-c  FILE  cDNA reference
+-d  FLOAT evalue significance level when comparing to reference cDNA [1e-20]
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>1000, c=>undef, d=>1e-20);
+getopts('a:b:c:d:', \%opts);
+
+ 
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+my $cdna_db = $opts{c};
+my $evalue2 = $opts{d};
+
+my @assemblies = <$dir*fasta>;
+my $contigs = $opts{b};
+my $out = $dir.'annotatable.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","total matches(%)", "\t","matched bases(%)", "\t", "avg accuracy(%)", "\n";
+foreach my $seq (@assemblies) {	
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  my $random1 = bootstrap($seq,$contigs);
+  print "start processing assembly $id!", "\n";
+  anno($id, $random1, $cdna_db, $evalue2);
+}
+close OUT;
+
+sub anno {
+        
+	my ($id, $random, $cdna_db, $evalue2) = @_;
+	my %master;
+	my $temp1 = 'query.fa';
+	my $temp2 = 'blatout';
+	
+	open(OUT2, ">$temp1");
+	for (my $i = 0; $i < scalar(@{$random}); $i++) { 
+		print OUT2 ">contig", $i, "\n", $random->[$i], "\n";
+		}
+	close(OUT2);
+	
+	my $call = system("blat $cdna_db $temp1 $temp2 -noHead -t=dnax -q=dnax -out=blast8");
+	
+	my %a; my $matches;
+	open(IN, "<$temp2");
+	while(<IN>){
+		chomp(my $line = $_);
+		my @d = split(/\t/, $line);
+		unless($a{$d[0]}) {
+			if ($d[10] < $evalue2) {
+				#it is a match
+				#how long is the match
+				my $length = length($random->[$1]) if $d[0] =~ m/contig(\d+)/;
+				$a{$d[0]}{'length'} = $d[3] / $length;
+				#how accurate is the match
+				$a{$d[0]}{'accuracy'} = $d[2];
+				#how many matches do we have
+				$matches++;
+				}
+			}
+		}
+      
+	my $length; my $accuracy;
+	foreach my $c (keys %a) {
+		$length += $a{$c}{'length'};
+		$accuracy += $a{$c}{'accuracy'};
+		}
+	$length = $length / $matches;
+	$accuracy = $accuracy / $matches;
+	
+	$master{$id}{'anno'} = $matches/scalar(@{$random});
+	$master{$id}{'lengthAnno'} = $length;
+	$master{$id}{'accuAnno'} = $accuracy;
+	
+	unlink($temp1); unlink($temp2);
+	
+	print OUT $id, "\t", $master{$id}{'anno'}*100, "\t", $master{$id}{'lengthAnno'}*100, "\t", $master{$id}{'accuAnno'} = $accuracy, "\n";
+	}
+}
+
+
+
+
+####################################################################################################################################################
+
+sub CONTIGUITY {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation CONTIGUITY [options]
+
+Options:
+
+-a  CHR   directory with all assemblies
+-b  INT   how many cDNA sequences do you want to test [1000]
+-c  FILE  cDNA reference
+-d  FLOAT evalue significance level when comparing to reference cDNA [1e-20]
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>1000, c=>undef, d=>1e-20);
+getopts('a:b:c:d:', \%opts);
+
+ 
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+my $cdna_db = $opts{c};
+my $evalue2 = $opts{d};
+
+my @assemblies = <$dir*fasta>;
+my $contigs = $opts{b};
+my $out = $dir.'Contiguity.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","complete(%)", "\t","contiguity(%)", "\n";
+foreach my $seq (@assemblies) {	
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  my $random1 = bootstrap($cdna_db,$contigs);
+  print "start processing assembly $id!", "\n";
+  con($seq, $id, $random1, $evalue2);
+}
+close OUT;
+
+sub con {
+	my ($seq, $id, $random, $evalue2) = @_;
+	my %master;
+	my $temp1 = 'query.fa';
+	my $temp2 = 'blatout';
+	my %seq;
+	open(OUT2, ">$temp1");
+	for (my $i = 0; $i < scalar(@{$random}); $i++) { 
+		print OUT2 ">cdna", $i, "\n", $random->[$i], "\n";
+		$seq{'cdna' . $i}{'length'} = length($random->[$i]);
+		}
+	close(OUT2);
+	
+	my %contiguity; my %complete;
+	my $call = system("blat $seq $temp1 $temp2 -noHead -out=blast8");
+	
+	open(IN, $temp2);
+	while(<IN>) {
+		my @d = split(/\t/,$_);
+		if ($d[10] < $evalue2) {
+			my $min = (sort { $a <=> $b } ($d[6], $d[7]))[0];
+			my $max = (sort { $a <=> $b } ($d[6], $d[7]))[1];
+			unless ($contiguity{$d[0]}) {
+				for (my $i = $min; $i <= $max; $i++) {
+					$contiguity{$d[0]}{$i}++;
+					}
+				}
+			for (my $i = $min; $i <= $max; $i++) {
+				$complete{$d[0]}{$i}++;
+				}	
+			}	
+		}
+	close IN;	
+	my $complete; my $contiguity;	
+	foreach my $c (%seq) {
+		if ($complete{$c}) {
+			$complete += scalar( keys %{$complete{$c}} ) / $seq{$c}{'length'};
+			$contiguity += scalar( keys %{$contiguity{$c}} ) / $seq{$c}{'length'};
+			}
+		}
+	$complete = $complete/scalar(keys %complete);
+	$contiguity = $contiguity/scalar(keys %complete);
+	
+	$master{$id}{'complete'} = $complete*100;		
+	$master{$id}{'contiguity'} = $contiguity*100;
+	
+	print OUT $id, "\t", $master{$id}{'complete'}, "\t", $master{$id}{'contiguity'}, "\n";
+	
+	unlink($temp1); unlink($temp2);
+	}
+
+}
+
+####################################################################################################################################################
+
+sub CEGMA {
+  die (qq/
+
+Usage: 6-AssemblyEvaluation CEGMA [options]
+
+Options:
+-a  CHR  directory with all assemblies
+-b  FILE  location of cegma file
+-c  FLOAT blast search evalue [1e-20]
+
+\n/) if !@ARGV;
+  
+  my %opts = (a=>undef,b=>undef, c=>1e-20);
+  getopts('a:b:c:', \%opts);
+  
+  my $dir;
+  
+  if ($opts{a} =~ m/\/$/ ){
+    $dir = $opts{a}; 
+  }
+  else {
+    $dir = $opts{a} . "/";
+  }
+  my @assemblies = <$dir*fasta>;
+
+  my $final = $dir. 'cegma.blast.out';
+  open (OUT, ">", $final);
+  print OUT "Assemblies", "\t", "cegma hit", "\n";
+  
+  
+  foreach my $seq (@assemblies) {
+    my $id = $1 if (basename($seq) =~ m/(\S+).fasta/);
+    my $out = $seq . '.cegma.blast.out';
+    my $call1 = system("makeblastdb -in $seq -dbtype nucl");
+    my $call2 = system("blastall -p tblastn -d $seq -i $opts{b} -e $opts{c} -m 8 -o $out -b 1");
+    my @call3 = `cut -f 1 $out | uniq | wc`;   
+    my $count = $1 if $call3[0] =~ m/^\s+(\d+)/;
+    print OUT $id, "\t", $count,"\n";
+    unlink ($out); my $call4 = system("rm $seq" . ".n*");
+  }
+  close OUT;
+}
+
+
+####################################################################################################################################################
+
+sub ORF {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation ORF [options]
+
+Options:
+
+-a  CHR  directory with all assemblies
+-b  INT how many contigs do you want to test [1000]
+
+\n/) if !@ARGV;
+  
+my %opts = (a=>undef, b=>1000);
+getopts('a:b:', \%opts);
+
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+
+my @assemblies = <$dir*fasta>;
+my $contigs = $opts{b};
+my $out = $dir.'ORFfinder.out';
+open (OUT, ">", $out);
+print OUT "Assemblies", "\t","ORF(%)", "\n";
+foreach my $seq (@assemblies) {	
+  my $id = $1 if basename($seq) =~ m/(\S+).fasta/;
+  my $random1 = bootstrap($seq,$contigs);
+  print "start processing assembly $id!", "\n";
+  ORFfinder($id,$random1,$contigs);
+}
+close OUT;
+
+sub ORFfinder {
+  my ($id,$array_ref,$contigs) = @_;
+  my %master;
+  $master{$id}{'orf'} = '0';
+ 
+  foreach (@$array_ref) {
+    my $seq = $_;
+    my @longest;
+    my $revcomp = reverse($seq);
+    $revcomp =~ tr/ATGCatgc/GACTgact/; 
+    my %seq = ('1' => $seq, '2' => substr($seq,1), '3' => substr($seq,2), '-1' => $revcomp, '-2' => substr($revcomp,1), '-3' => substr($revcomp,2));
+    foreach(keys %seq) {
+      my @orfs = translate($seq{$_}) =~ m/([A-Z]+)/g;      
+      @orfs = sort{length($a) <=> length($b)} @orfs;
+      push(@longest, length($orfs[-1]));
+    }
+    @longest = sort{$a <=> $b} @longest;
+    $master{$id}{'orf'} += $longest[-1]*3/length($seq);
+    
+  }
+  $master{$id}{'orf'} = sprintf("%.3f", $master{$id}{'orf'}/$contigs);
+  
+  print OUT $id, "\t", $master{$id}{'orf'}, "\n";
+  
+}
+
+sub translate {
+	my ($string) = @_;
+	$string = uc($string);
+	my @codons = $string =~ m/(\S\S\S)/g;
+	my %codons = (	'ATG'=>'M','ACG'=>'T','CTG'=>'L','CCG'=>'P','GTG'=>'V','GCG'=>'A','TTG'=>'L','TCG'=>'S',
+					'ATA'=>'I','ACA'=>'T','CTA'=>'L','CCA'=>'P','GTA'=>'V','GCA'=>'A','TTA'=>'L','TCA'=>'S',
+					'ATC'=>'I','ACC'=>'T','CTC'=>'L','CCC'=>'P','GTC'=>'V','GCC'=>'A','TTC'=>'F','TCC'=>'S',
+					'ATT'=>'I','ACT'=>'T','CTT'=>'L','CCT'=>'P','GTT'=>'V','GCT'=>'A','TTT'=>'F','TCT'=>'S',
+					'AGG'=>'R','AAG'=>'K','CGG'=>'R','CAG'=>'Q','GGG'=>'G','GAG'=>'E','TGG'=>'W','TAG'=>'*',
+					'AGA'=>'R','AAA'=>'K','CGA'=>'R','CAA'=>'Q','GGA'=>'G','GAA'=>'E','TGA'=>'*','TAA'=>'*',
+					'AGC'=>'S','AAC'=>'N','CGC'=>'R','CAC'=>'H','GGC'=>'G','GAC'=>'D','TGC'=>'C','TAC'=>'Y',
+					'AGT'=>'S','AAT'=>'N','CGT'=>'R','CAT'=>'H','GGT'=>'G','GAT'=>'D','TGT'=>'C','TAT'=>'Y');
+	my $translate;
+	foreach(@codons) {
+		if ($codons{$_}) {
+			$translate = $translate . $codons{$_};
+			}
+		else {
+			$translate = $translate . 'X';
+			}
+		}
+	return($translate);
+	}
+sub bootstrap {
+  my ($seq,$num) = @_;
+  
+  my @seq;
+  my $c = -1;
+  
+  open(SEQ, "<$seq");
+  while(<SEQ>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      $c++;
+    }
+    else { 
+      $seq[$c] .= $line;
+    }
+  }
+  close(SEQ);
+  
+  
+  my @random;
+  for (my $i = 0; $i < $num; $i++) {
+    $random[$i] = $seq[int($#seq*rand())];
+  }		
+  return \@random;
+}		
+
+}
+
+
+####################################################################################################################################################
+
+
+sub BASIC {
+
+die (qq/
+
+Usage: 6-AssemblyEvaluation BASIC [options]
+
+Options:
+-a  DIR  directory with all assemblies
+
+\n/) if !@ARGV;
+
+my %opts = (a=>undef);
+getopts('a:', \%opts);
+
+my $dir;
+ 
+if ($opts{a} =~ m/\/$/ ){
+$dir = $opts{a}; 
+}
+else {
+$dir = $opts{a} . "/";
+}
+
+my @assemblies = <$dir*fasta>;
+my $out = $dir . "basic_evaluation.out";
+open (OUT, ">", $out);
+print OUT "Assembly","\t", "TotalLength","\t", "TotalContigs","\t", "Mean","\t", "Median", "\t", "Max","\t", ">2000bp","\t", ">1000bp","\t", ">500bp","\t", "N25", "\t","N50", "\t", "N90", "\t", "GC%", "\n";
+foreach my $assembly (@assemblies) {
+  my %master;
+  my %seq;
+  print "Processing","\t", basename($assembly), "\n";
+  
+  open (IN,"<", $assembly);
+  my $id =$1, if basename($assembly) =~ m/(\S+).fasta/;
+  my $histogram = $dir . $id . ".hist";
+  my $con;
+    while (<IN>) {
+    chomp(my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      $con = $1;
+    }
+    else { 
+      $seq{$con} .= $line;
+    }
+  }
+  close IN;
+  
+open (HIST, ">", $histogram);
+
+#codes from Joseph Fass (UC Davis), starts here
+my $int;
+my %len;
+foreach my $id (keys %seq) {
+	$int = floor(length($seq{$id})/100);
+	if( !defined($len{$int}) ) {
+		$len{$int} = 1;
+	} else {
+		$len{$int}++;
+	}
+}
+my @ints = sort { $a <=> $b } keys(%len);
+for(my $i=$ints[0]; $i <= $ints[-1]; $i++) {
+	$len{$i} = 0 if(!defined($len{$i}));
+	printf HIST "%d:%d \t$len{$i}\n", ( ($i*100), ($i*100+99) );
+}
+close HIST;
+#ends here
+
+  my @length;
+  foreach my $c (sort {$a cmp $b} keys %seq) {
+    push(@length, length($seq{$c}));
+    $master{$id}{'totLength'} += length($seq{$c});
+    $master{$id}{'GC'} += ($seq{$c} =~ tr/gGcC/gGcC/);
+    
+  }
+  
+  @length = sort {$a <=> $b} (@length);
+  $master{$id}{'mean'} = int($master{$id}{'totLength'}/scalar(@length));
+  $master{$id}{'median'} = $length[int($#length/2)];
+  $master{$id}{'totContigs'} = scalar(@length);
+  $master{$id}{'max'} = $length[$#length];
+  my $track;
+  $master{$id}{'n2000'} = 0;
+  $master{$id}{'n1000'} = 0;
+  $master{$id}{'n500'} = 0;
+  for (my $i = 0; $i < scalar(@length); $i++) {
+    $track += $length[$i];
+    if ($length[$i] > 2000) {
+      $master{$id}{'n2000'}++;
+      $master{$id}{'n1000'}++;
+      $master{$id}{'n500'}++;
+    }
+    elsif ($length[$i] > 1000) {
+      $master{$id}{'n1000'}++;
+      $master{$id}{'n500'}++;
+    }
+    elsif ($length[$i] > 500) {
+      $master{$id}{'n500'}++;
+    }
+    if ($track/$master{$id}{'totLength'} > 0.1) {
+     $master{$id}{'n90'} = $length[$i] unless $master{$id}{'n90'};			
+    }
+    if ($track/$master{$id}{'totLength'} > 0.5) {
+      $master{$id}{'n50'} = $length[$i] unless $master{$id}{'n50'};			
+    }
+    if ($track/$master{$id}{'totLength'} > 0.75) {
+      $master{$id}{'n25'} = $length[$i] unless $master{$id}{'n25'};			
+    }
+    
+  }				
+  
+print OUT $id,"\t", $master{$id}{'totLength'},"\t", $master{$id}{'totContigs'},"\t", $master{$id}{'mean'},"\t", $master{$id}{'median'}, "\t", $master{$id}{'max'},"\t", $master{$id}{'n2000'},"\t", $master{$id}{'n1000'},"\t", $master{$id}{'n500'},"\t", $master{$id}{'n25'},"\t", $master{$id}{'n50'},"\t",  $master{$id}{'n90'},"\t";
+
+printf OUT  "%.2f", ($master{$id}{'GC'}/$master{$id}{'totLength'} * 100);
+print OUT  "\n";   
+  
+}
+
+close OUT;
+
+
+}
+
+####################################################################################################################################################
+
+
+sub COVERAGE {
+  die(qq/
+Usage 6-AssemblyEvaluation COVERAGE [options]
+
+Options: 
+-p    DIR          folder containing all pileup 
+                   files generated by "samtools 
+                   mpileup -f ref.fa sample1.bam
+                   > sample1.pileup" 
+-c    INT          coverage cutoff [5] 
+-q    INT          base quality cutoff [13] 
+         
+\n/) if (!@ARGV);
+  
+  my %opts = (p=>undef, c=>5, q=>13);
+  getopts('p:c:q:', \%opts);
+  
+  
+  my $dir;	
+  if ($opts{p} =~m/\/$/) {
+    $dir = $opts{p};
+  }
+  else {
+    $dir = $opts{p} . "/";
+  }
+  
+  
+  my @pileup = <$dir*pileup>;
+  
+  foreach (@pileup) {
+    my $file = $_;
+    open (IN, '<' , $file);
+    my $id = $1 if basename($_) =~ m/(\S+).pileup/;
+    
+    my $above_qv_bases =0;
+    
+    my $err_count = 0;
+    my $out = $dir . $id . ".out";  
+    open (OUT, '>', $out);
+    while (<IN>) {
+      chomp;
+      next if m/^\#/;
+      my @fields = split /\t+/;
+      next if $fields[2] eq "*";
+      next if $fields[2] eq "N";
+      my $read_bases = $fields[4];
+      next if $fields[3] < $opts{c};
+      my $base_quality = $fields[5];
+      next if ($read_bases =~ m/[\+|\-]/);
+      if ($read_bases =~ m/[\$|\^|\.|\,]/) {
+	$read_bases =~ s/\^.//g; 
+	$read_bases =~ s/\$//g; 
+	
+      }
+      if (length($read_bases) != length($base_quality) ) {
+	print "STOP! the number of bases is not the same as that of base quality!\n";
+      }
+      
+      
+      my @bases = split //, $read_bases;  
+      my @qv    = split //, $base_quality;
+      my $ref = 0;
+      my $alt = 0;
+      
+      for my $base (0 .. @bases -1) {
+	
+	if ( ord( $qv[$base] ) - 33 >= $opts{q} and $bases[ $base ] ne '*') {
+	  ++$above_qv_bases;
+	  
+	  if ( $bases[$base] =~ m/[\.|\,]/i ) {
+	    $ref++;
+	  } 
+	  elsif ( $bases[ $base ] =~ m/[ATGCatgc]/ ) {
+	    $alt++;
+	  }
+	}
+      }
+      if ($alt > 0 && $alt < $ref && $alt/($alt+$ref) < 0.1 ) {
+	$err_count += $alt; 
+      } 
+      if ($alt > 0 && $alt > $ref && $ref/($alt+$ref) < 0.1 ) {
+	$err_count += $ref;
+      }
+      
+    }
+    printf "Error rate: %.3f", $err_count/$above_qv_bases*100;
+    print  "%","\n";
+    
+    printf OUT "Error rate: %.3f", $err_count/$above_qv_bases*100;
+    print OUT "%","\n";
+    close IN;
+    
+    
+    my $totalq = 0;
+    my $count = 0;
+    my $expxsqr = 0;
+    
+    
+    open(PILEUP,'<',$file);
+    while (<PILEUP>) {
+      my $rscores = [split /\s+/, (translate_ascii(join(" ",split(//,(split /\s+/, $_)[5]))))];
+      my @ascores = adjust_score($rscores, 33);
+      foreach (@ascores) {
+	$totalq = $totalq + $_;
+	$expxsqr = $expxsqr + ($_ ** 2);
+	$count++;
+      }
+    }
+    close PILEUP;
+    
+    
+    my $expq = $totalq/$count; 
+    my $varq = ($expxsqr - (($totalq ** 2) / $count)) / ($count - 1); 
+    my $std = sqrt ($varq);
+    
+    
+    printf "Average Quality Score: %.3f", $expq;
+    print "\n"; 
+    printf "Quality Score Variance: %.3f", $varq;
+    print "\n";
+    printf "Quality Score Standard Deviation: %.3f", $std;
+    print "\n";
+    printf OUT "Average Quality Score: %.3f", $expq;
+    print OUT "\n"; 
+    printf OUT "Quality Score Variance: %.3f", $varq;
+    print OUT "\n";
+    printf OUT "Quality Score Standard Deviation: %.3f", $std;
+    print OUT "\n";
+    
+    sub translate_ascii {
+      my $sub = $_[0];
+      $sub =~ s/!/33/g;$sub =~ s/"/34/g;$sub =~ s/#/35/g;$sub =~ s/\$/36/g;$sub =~ s/%/37/g;$sub =~ s/&/38/g;$sub =~ s/'/39/g;$sub =~ s/\(/40/g;$sub =~ s/\)/41/g;$sub =~ s/\*/42/g;$sub =~ s/\+/43/g;$sub =~ s/,/44/g;$sub =~ s/-/45/g;$sub =~ s/\./46/g;$sub =~ s/\//47/g;$sub =~ s/\b0\b/48/g;$sub =~ s/\b1\b/49/g;$sub =~ s/\b2\b/50/g;$sub =~ s/\b3\b/51/g;$sub =~ s/\b4\b/52/g;$sub =~ s/\b5\b/53/g;$sub =~ s/\b6\b/54/g;$sub =~ s/\b7\b/55/g;$sub =~ s/\b8\b/56/g;$sub =~ s/\b9\b/57/g;$sub =~ s/:/58/g;$sub =~ s/;/59/g;$sub =~ s/</60/g;$sub =~ s/=/61/g;$sub =~ s/>/62/g;$sub =~ s/\?/63/g;$sub =~ s/@/64/g;$sub =~ s/A/65/g;$sub =~ s/B/66/g;$sub =~ s/C/67/g;$sub =~ s/D/68/g;$sub =~ s/E/69/g;$sub =~ s/F/70/g;$sub =~ s/G/71/g;$sub =~ s/H/72/g;$sub =~ s/I/73/g;$sub =~ s/J/74/g;$sub =~ s/K/75/g;$sub =~ s/L/76/g;$sub =~ s/M/77/g;$sub =~ s/N/78/g;$sub =~ s/O/79/g;$sub =~ s/P/80/g;$sub =~ s/Q/81/g; $sub =~ s/R/82/g; $sub =~ s/S/83/g;$sub =~ s/T/84/g;$sub =~ s/U/85/g; $sub =~ s/V/86/g;$sub =~ s/W/87/g; $sub =~ s/X/88/g; $sub =~ s/Y/89/g;$sub =~ s/Z/90/g;$sub =~ s/\[/91/g;$sub =~ s/\\/92/g;$sub =~ s/]/93/g;$sub =~ s/\^/94/g;$sub =~ s/_/95/g; $sub =~ s/`/96/g;$sub =~ s/a/97/g; $sub =~ s/b/98/g; $sub =~ s/c/99/g; $sub =~ s/d/100/g;$sub =~ s/e/101/g;$sub =~ s/f/102/g;$sub =~ s/g/103/g;$sub =~ s/h/104/g;$sub =~ s/i/105/g;$sub =~ s/j/106/g;$sub =~ s/k/107/g;$sub =~ s/l/108/g;$sub =~ s/m/109/g;$sub =~ s/n/110/g; $sub =~ s/o/111/g;$sub =~ s/p/112/g;$sub =~ s/q/113/g;$sub =~ s/r/114/g;$sub =~ s/s/115/g;$sub =~ s/t/116/g; $sub =~ s/u/117/g;$sub =~ s/v/118/g;$sub =~ s/w/119/g;$sub =~ s/x/120/g;$sub =~ s/y/121/g;$sub =~ s/z/122/g;$sub =~ s/\{/123/g; $sub =~ s/\|/124/g;$sub =~ s/}/125/g;$sub =~ s/~/126/g;
+      return $sub;
+    }
+    
+    sub adjust_score {
+      my ($rs, $av) = @_;
+      my @adj = undef;
+      my $pos = 0;
+      foreach (@{$rs}) {
+	$adj[$pos] = $_ - $av;
+	$pos++;
+      }
+      return(@adj)
+    }
+    
+    open(PILEUP,'<',$file);
+    my @pline = split(/\s+/, <PILEUP>);
+    my $prev_cont;
+    if ($pline[0] =~ /(\S+)/) {
+      $prev_cont = $1;
+    }
+    my ($depth, $pos, $first) = ($pline[3], 1, $pline[1]);
+    my ($avg_depth, $last);
+    
+    while (<PILEUP>) {
+      @pline = split(/\s+/, $_);
+      my $contig = $pline[0];
+      if ($prev_cont eq $contig) { # if on the same contig
+	$depth += $pline[3];
+	$pos++;
+	$last = $pline[1];
+	if (eof) {
+	  $avg_depth = $depth/$pos;
+	  printf OUT "Average Coverage: %.3f", $avg_depth;
+	  print OUT "\n";
+	  printf  "Average Coverage: %.3f", $avg_depth;
+	  print  "\n";
+	}
+      } 
+      elsif ($prev_cont ne $contig) 
+	{ # new contig
+	  $avg_depth = $depth/$pos;
+	  printf OUT "Average Coverage: %.3f", $avg_depth;
+	  print OUT "\n";
+	  printf  "Average Coverage: %.3f", $avg_depth;
+	  print  "\n";
+	  $prev_cont = $contig;
+	  $first = $pline[1];
+	  ($depth, $pos) = ($pline[3], 1);
+	}
+    } 
+    
+    close PILEUP;
+    close OUT;
+  }
+}
+####################################################################################################################################################
+
+
+sub FIX {
+  die(qq/
+Usage 6-AssemblyEvaluation FIX [options]
+
+options: -p FILE     pileup file generated using samtools  
+         -a FILE     original assemblies that is used for mapping and generating the pileup file used in -a
+         -i FLOAT    coverage filter for indel: if the ratio of indel to total coverage is over i then this site will be masked [0.1]
+         -c INT      minimal coverage to call a concensus [1]
+         -q INT      minimal quality to call a concensus [13]
+         -m          if provided, assume mitochondrial. It will mask any sites if r < alt\/all < 1-r 
+         -r FLOAT    MAF cutoff for masking sites when m is used, require -m [0.2] 
+         -f CHAR     output prefix	
+
+\n/) if !@ARGV;
+
+my %opts = (p=>undef, a=>undef, f=>undef, c=>1, q=>13,r=>0.2, i=>0.1);
+getopts('p:a:f:c:q:r:i:m', \%opts);
+
+my $pileup = $opts{p};
+my $orig = $opts{a};
+my $fixed = $opts{f} . "_fixed.fa";
+my $pos = $opts{f} . "_pos.txt";
+my $cov = $opts{c};
+my $qual = $opts{q}; 
+ 
+open(PILEUP,'<', $pileup);
+open(FASTA,'<', $orig);
+open(FIX,'>', $fixed); 
+open(SITE,'>', $pos); 
+print SITE "Contig\tPosition\tOriginal\tNow\n"; 
+
+my %pileup;
+  while (<PILEUP>) {
+    next if m/^\#/;
+    chomp(my @fields = split /\s+/, $_);
+    my $base = $fields[2];
+    my $coverage = $fields[3];
+    my $read_bases   = $fields[4];
+    my $base_quality = $fields[5];
+    
+    
+    if ($base eq "*") {
+      $pileup{$fields[0]}{$fields[1]} = 'N';
+      print SITE $fields[0], "\t", $fields[1],"\t", $base, "\t", 'N',"\n";
+      next;
+    }
+    elsif ($coverage < $cov) {
+      $pileup{$fields[0]}{$fields[1]} = 'N';     
+      print SITE $fields[0], "\t", $fields[1],"\t", "low_cov", "\t", 'N',"\n";
+      next;
+    }
+    elsif ($read_bases =~ m/[\+|\-]/) {
+      my $indel = 0;
+      $read_bases =~ s/\^.//g;
+      $read_bases =~ s/\$//g;
+      my @bases = split //, $read_bases;
+      for my $base (0 .. @bases -1) {
+	if ( $bases[ $base ] eq  '-' ||  $bases[ $base ] eq  '+') {
+	  $indel++;
+	}
+      }	
+      
+      if ($indel/$coverage > $opts{i}) {
+	
+	$pileup{$fields[0]}{$fields[1]} = 'N';
+	print SITE $fields[0], "\t", $fields[1],"\t", "indel", "\t", 'N',"\n";
+	next;
+      }
+    }
+    
+    
+    elsif ($read_bases =~ m/[\$|\^|\.|\,|[ATGCatgc]/) {
+      $read_bases =~ s/\^.//g; 
+      $read_bases =~ s/\$//g; 
+
+      my $ref = 0;
+      my $alt = 0;
+      my $A = 0;
+      my $G = 0;
+      my $C = 0;
+      my $T = 0;
+      my $N = 0;
+      my $qual_base = 0;
+      
+      my @bases = split //, $read_bases;  
+      my @qv    = split //, $base_quality;
+
+      for my $base (0 .. @bases -1) {
+	
+	if ( ord( $qv[$base] ) - 33 >= $qual and $bases[ $base ] ne '*') {
+	  $qual_base++;
+	  if ( $bases[$base] =~ m/[\.|\,]/i ) {
+	    $ref++;
+	  } 
+	  elsif ( $bases[ $base ] =~ m/[NATGCnatgc]/ ) {
+	   $A++ if ($bases[$base] eq 'A' || $bases[$base] eq 'a');
+	   $G++ if ($bases[$base] eq 'G' || $bases[$base] eq 'g');
+	   $C++ if ($bases[$base] eq 'C' || $bases[$base] eq 'c');
+	   $T++ if ($bases[$base] eq 'T' || $bases[$base] eq 't');
+	   $N++ if ($bases[$base] eq 'N' || $bases[$base] eq 'n');
+	    
+	   $alt++;
+	  }
+	}
+      }
+      my %base;
+      
+      $base{$A} = 'A';
+      $base{$C} = 'C';
+      $base{$G} = 'G';
+      $base{$T} = 'T';
+      $base{$N} = 'N';
+      
+      my $max = max($A, $G, $C, $T, $N);
+      
+      if ($opts{m}) { 
+	next if $alt + $ref == 0;
+	if ($max/($alt + $ref) < (1-$opts{r}) && $max/($alt + $ref) > $opts{r}) {
+	  $pileup{$fields[0]}{$fields[1]} = 'N';
+	  print SITE $fields[0], "\t", $fields[1],"\t", $base, "\t", 'N',"\n";
+	}
+	else {
+	  if ($ref < $alt) {
+	    $pileup{$fields[0]}{$fields[1]} = $base{$max};
+	    print SITE $fields[0], "\t", $fields[1],"\t", $base, "\t", $base{$max},"\n";
+	  }
+	}
+      } 
+      if (!$opts{m}) {	
+	if ($ref < $alt) {
+	  $pileup{$fields[0]}{$fields[1]} = $base{$max};
+	  print SITE $fields[0], "\t", $fields[1],"\t", $base, "\t", $base{$max},"\n";
+	}	
+	
+      }
+      
+    }
+    
+  }
+  close SITE;
+  
+  
+  while (<FASTA>) {
+    
+    chomp (my $line = $_);
+    if ($line =~ m/^>(\S+)/) {
+      my $contig =$1;
+      chomp(my $seq = <FASTA>);
+      if (!$pileup{$contig}) {
+	print FIX ">$contig", "\n", $seq,"\n";
+    }
+    
+    
+    if ($pileup{$contig}) {
+      foreach my $change (sort { $a <=> $b } keys %{$pileup{$contig}}) {
+	substr($seq, $change-1, 1) = $pileup{$contig}{$change};	
+      }
+      print FIX ">$contig", "\n", $seq,"\n"; 
+    }
+    
+    
+  }
+
+ } 
+  close FIX;
+  close FASTA;
+  
+}
+
+
+
